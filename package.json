@@ -1,0 +1,12 @@
+{
+  "name": "ai-workflow",
+  "version": "1.0.0",
+  "description": "AI-powered development workflow system",
+  "scripts": {
+    "start": "cd ai-work && set \"CODEBASE_PATH=../test-project\" && node ../watcher.js",
+    "reset": "cd ai-work && node ../reset.js"
+  },
+  "keywords": ["ai", "development", "workflow", "automation"],
+  "author": "",
+  "license": "MIT"
+}
