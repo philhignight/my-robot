@@ -99,6 +99,37 @@ function hasMessageEnd(text) {
   return text.includes('[[[MESSAGE_END]]]');
 }
 
+function validateMessageFormat(text) {
+  const separatorIndex = text.indexOf('====TOOLS====');
+  
+  if (separatorIndex === -1) {
+    // No tools, just check for message end
+    if (!hasMessageEnd(text)) {
+      throw new Error('Invalid format: Missing [[[MESSAGE_END]]]');
+    }
+    return true;
+  }
+  
+  const beforeSeparator = text.slice(0, separatorIndex).trim();
+  const afterSeparator = text.slice(separatorIndex + 13);
+  
+  if (!beforeSeparator) {
+    throw new Error('Invalid format: No response content before ====TOOLS====');
+  }
+  
+  if (!hasMessageEnd(text)) {
+    throw new Error('Invalid format: Missing [[[MESSAGE_END]]]');
+  }
+  
+  // Check for English text after separator
+  const cleanAfterSeparator = afterSeparator.replace(/\[\[\[MESSAGE_END\]\]\]/g, '').replace(/@\w+\s*\{[^}]*\}/gs, '').trim();
+  if (cleanAfterSeparator) {
+    throw new Error('Invalid format: English text found below ====TOOLS==== separator');
+  }
+  
+  return true;
+}
+
 async function searchFilesByName(folder, regex) {
   const pattern = new RegExp(regex, 'i');
   const results = [];
