@@ -782,9 +782,24 @@ async function buildPrompt() {
     // Extract just the conversation history
     const lines = conversation.split('\n');
     const historyIndex = lines.findIndex(function(line) { return line.includes('=== CONVERSATION HISTORY ==='); });
+    const waitingIndex = lines.findIndex(function(line) { return line.includes('=== WAITING FOR YOUR MESSAGE ==='); });
+    
     let conversationHistory = '';
-    if (historyIndex !== -1 && historyIndex + 1 < lines.length) {
-      conversationHistory = lines.slice(historyIndex + 1).join('\n').trim();
+    if (historyIndex !== -1) {
+      // Only get content between history marker and waiting marker
+      if (waitingIndex > historyIndex) {
+        conversationHistory = lines.slice(historyIndex + 1, waitingIndex).join('\n').trim();
+      } else {
+        conversationHistory = lines.slice(historyIndex + 1).join('\n').trim();
+      }
+      
+      // Remove any "=== AI RESPONSE READY ===" lines that might have been left
+      conversationHistory = conversationHistory.split('\n')
+        .filter(function(line) { 
+          return !line.includes('=== AI RESPONSE READY ===') && 
+                 !line.includes('Copy the contents of generated-prompt.md');
+        })
+        .join('\n');
     }
     
     // Check if we need to compact the conversation
@@ -893,8 +908,15 @@ async function processResponse() {
 }
 
 async function handleResponseTypeError(errorMessage, responseText) {
-  // Add the invalid response to conversation so AI can see what went wrong
-  const cleanResponse = utils.replaceToolsWithIndicators(responseText, []);
+  // Add the invalid response to conversation, ensuring it's properly formatted
+  let cleanResponse;
+  if (responseText.includes('┌─ ASSISTANT')) {
+    // Already has box format - fix padding if needed
+    cleanResponse = utils.fixBoxPadding(responseText);
+  } else {
+    // No box format - add it
+    cleanResponse = utils.formatInBox(responseText, 70);
+  }
   await updateConversation(cleanResponse);
   
   const errorResponse = 'SYSTEM: ERROR - ' + errorMessage + '\n\n' +
@@ -909,7 +931,6 @@ async function handleResponseTypeError(errorMessage, responseText) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  await updateConversationForPrompt();
   console.log('✓ Error prompt ready in generated-prompt.md');
 }
 
@@ -932,7 +953,6 @@ async function handleReadResponse(responseText, tools) {
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  await updateConversationForPrompt();
   console.log('✓ Read operations complete, next prompt ready');
 }
 
@@ -983,7 +1003,6 @@ async function handleWriteResponse(responseText, tools) {
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  await updateConversationForPrompt();
   console.log('✓ Write response processed, next prompt ready');
 }
 
@@ -1004,7 +1023,6 @@ async function handleFormatError(errorMessage) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  await updateConversationForPrompt();
   console.log('✓ Error prompt ready in generated-prompt.md');
 }
 
@@ -1025,7 +1043,6 @@ async function handleIncompleteMessage(responseText) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  await updateConversationForPrompt();
   console.log('✓ Continuation prompt ready in generated-prompt.md');
 }
 
@@ -1378,7 +1395,6 @@ async function requestFileConfirmation(tool, result) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  await updateConversationForPrompt();
   console.log('✓ Confirmation prompt ready in generated-prompt.md');
   
   console.log('⚠ File operation pending confirmation: ' + tool.params.file_name);
@@ -1415,7 +1431,6 @@ async function handlePendingUpdate(responseText) {
     
     const buildPrompt = require('./message-to-prompt').buildPrompt;
     await buildPrompt();
-    await updateConversationForPrompt();
     console.log('✓ Next prompt ready in generated-prompt.md');
     
   } else {
@@ -1439,24 +1454,14 @@ async function handlePendingUpdate(responseText) {
       
       const buildPrompt = require('./message-to-prompt').buildPrompt;
       await buildPrompt();
-      await updateConversationForPrompt();
       console.log('✓ Error prompt ready in generated-prompt.md');
     }
   }
 }
 
 async function updateConversationForPrompt() {
-  const conversation = await utils.readFileIfExists('conversation.md');
-  
-  const lines = conversation.split('\n');
-  const waitingIndex = lines.findIndex(function(line) { return line.includes('=== WAITING FOR YOUR MESSAGE ==='); });
-  
-  if (waitingIndex !== -1) {
-    lines[waitingIndex] = '=== AI RESPONSE READY ===';
-    lines[waitingIndex + 1] = 'Copy the contents of generated-prompt.md and submit to AI';
-    
-    await fs.writeFile('conversation.md', lines.join('\n'), 'utf8');
-  }
+  // Don't add any markers - conversation already has the content
+  // This function is now just a placeholder for compatibility
 }
 
 async function updateConversation(newMessage) {
