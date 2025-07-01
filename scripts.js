@@ -65,34 +65,97 @@ function parseBlocks(text) {
 }
 
 function parseToolBlocks(text) {
-  const toolMatch = text.match(/TOOLS: \[\[\[TOOLS\]\]\]\n(.*?)\n\[\[\[\/\]\]\]/s);
-  if (!toolMatch) return [];
-  
-  const toolsContent = toolMatch[1];
   const tools = [];
-  const toolRegex = /^(\w+): \[\[\[VALUE\]\]\]\n(.*?)\n\[\[\[\/\]\]\]/gms;
+  const toolRegex = /@(\w+)\s*\{([^}]*)\}/gs;
   let match;
   
-  while ((match = toolRegex.exec(toolsContent)) !== null) {
+  while ((match = toolRegex.exec(text)) !== null) {
     const toolName = match[1];
-    const params = match[2];
-    const paramLines = params.split('\n');
-    const parsedParams = {};
+    const blockContent = match[2];
+    const params = {};
     
-    for (let i = 0; i < paramLines.length; i++) {
-      const line = paramLines[i];
-      const colonIndex = line.indexOf(':');
-      if (colonIndex > -1) {
-        const key = line.slice(0, colonIndex).trim();
-        const value = line.slice(colonIndex + 1).trim();
-        parsedParams[key] = value;
-      }
+    // Parse key-value pairs
+    const paramRegex = /(\w+):\s*\[\[\[value\]\]\]\s*(.*?)\s*\[\[\[\/\]\]\]/gs;
+    let paramMatch;
+    
+    while ((paramMatch = paramRegex.exec(blockContent)) !== null) {
+      params[paramMatch[1]] = paramMatch[2].trim();
     }
     
-    tools.push({ name: toolName, params: parsedParams });
+    tools.push({ 
+      name: toolName, 
+      params: params,
+      startIndex: match.index,
+      endIndex: match.index + match[0].length
+    });
   }
   
   return tools;
+}
+
+function classifyTools(tools) {
+  const informationTools = ['READ_FILE', 'SEARCH_FILES_BY_NAME', 'SEARCH_FILES_BY_CONTENT'];
+  const responseTools = ['DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
+                        'CREATE_NEW_FILE', 'UPDATE_FILE', 'INSERT_LINES', 'DELETE_FILE',
+                        'SWITCH_TO', 'COMMIT'];
+  
+  const hasInfoTools = tools.some(t => informationTools.includes(t.name));
+  const hasResponseTools = tools.some(t => responseTools.includes(t.name));
+  
+  if (hasInfoTools && hasResponseTools) {
+    return { 
+      type: 'mixed', 
+      error: 'Cannot mix information gathering tools with response/action tools'
+    };
+  }
+  
+  if (hasInfoTools) return { type: 'information' };
+  if (hasResponseTools) return { type: 'response' };
+  return { type: 'empty' };
+}
+
+function validateResponseType(text, tools) {
+  const classification = classifyTools(tools);
+  
+  // Remove tool blocks and message end marker
+  const responseContent = text
+    .replace(/@\w+\s*\{[^}]*\}/gs, '')
+    .replace(/\[\[\[MESSAGE_END\]\]\]/g, '')
+    .trim();
+  
+  // Check for substantial content (more than just whitespace)
+  const hasContent = responseContent.length > 10;
+  
+  switch (classification.type) {
+    case 'mixed':
+      return { 
+        valid: false, 
+        error: classification.error 
+      };
+      
+    case 'information':
+      if (hasContent) {
+        return { 
+          valid: false, 
+          error: 'Information gathering responses cannot contain text. Use tools only.' 
+        };
+      }
+      return { valid: true, type: 'information' };
+      
+    case 'response':
+      // Response type can have content or not
+      return { valid: true, type: 'response' };
+      
+    case 'empty':
+      // No tools - must be a pure text response
+      if (!hasContent) {
+        return { 
+          valid: false, 
+          error: 'Response must contain either tools or text content' 
+        };
+      }
+      return { valid: true, type: 'text' };
+  }
 }
 
 function replaceToolsWithIndicators(text, tools) {
@@ -107,13 +170,16 @@ function replaceToolsWithIndicators(text, tools) {
     
     switch (tool.name) {
       case 'READ_FILE':
-        indicator = '--> Read file: ' + tool.params.file_name;
+        indicator = '--> Read file: ' + tool.params.file_name + 
+          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
         break;
       case 'SEARCH_FILES_BY_NAME':
-        indicator = '--> Search files by name: ' + tool.params.regex + ' in ' + tool.params.folder;
+        indicator = '--> Search files by name: ' + tool.params.regex + ' in ' + tool.params.folder +
+          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
         break;
       case 'SEARCH_FILES_BY_CONTENT':
-        indicator = '--> Search files by content: ' + tool.params.regex + ' in ' + tool.params.folder;
+        indicator = '--> Search files by content: ' + tool.params.regex + ' in ' + tool.params.folder +
+          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
         break;
       case 'CREATE_NEW_FILE':
         indicator = '--> Create file: ' + tool.params.path;
@@ -157,33 +223,9 @@ function hasMessageEnd(text) {
 }
 
 function validateMessageFormat(text) {
-  const separatorIndex = text.indexOf('====TOOLS====');
-  
-  if (separatorIndex === -1) {
-    // No tools, just check for message end
-    if (!hasMessageEnd(text)) {
-      throw new Error('Invalid format: Missing [[[MESSAGE_END]]]');
-    }
-    return true;
-  }
-  
-  const beforeSeparator = text.slice(0, separatorIndex).trim();
-  const afterSeparator = text.slice(separatorIndex + 13);
-  
-  if (!beforeSeparator) {
-    throw new Error('Invalid format: No response content before ====TOOLS====');
-  }
-  
   if (!hasMessageEnd(text)) {
     throw new Error('Invalid format: Missing [[[MESSAGE_END]]]');
   }
-  
-  // Check for English text after separator
-  const cleanAfterSeparator = afterSeparator.replace(/\[\[\[MESSAGE_END\]\]\]/g, '').replace(/@\w+\s*\{[^}]*\}/gs, '').trim();
-  if (cleanAfterSeparator) {
-    throw new Error('Invalid format: English text found below ====TOOLS==== separator');
-  }
-  
   return true;
 }
 
@@ -334,6 +376,117 @@ function compactDiscoveries(discoveries, maxCount) {
   return result.join('\n');
 }
 
+function compactConversation(conversationHistory, maxLength) {
+  if (maxLength === undefined) maxLength = 50000; // Default max length for conversation
+  
+  if (conversationHistory.length <= maxLength) {
+    return conversationHistory;
+  }
+  
+  const lines = conversationHistory.split('\n').filter(function(line) { return line.trim(); });
+  
+  // Find conversation exchanges (USER: and ASSISTANT: pairs)
+  const exchanges = [];
+  let currentExchange = { user: '', assistant: '', other: [] };
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    if (line.startsWith('USER: ')) {
+      // Start new exchange
+      if (currentExchange.user || currentExchange.assistant.length > 0) {
+        exchanges.push(currentExchange);
+      }
+      currentExchange = { user: line, assistant: '', other: [] };
+    } else if (line.startsWith('ASSISTANT: ')) {
+      currentExchange.assistant = line;
+    } else if (line.startsWith('TOOL RESULT') || line.startsWith('SYSTEM:') || line.startsWith('-->')) {
+      currentExchange.other.push(line);
+    }
+  }
+  
+  // Add the last exchange
+  if (currentExchange.user || currentExchange.assistant.length > 0) {
+    exchanges.push(currentExchange);
+  }
+  
+  if (exchanges.length <= 3) {
+    return conversationHistory; // Don't compact if very short
+  }
+  
+  // Keep recent exchanges (last 3) and summarize older ones
+  const recentExchanges = exchanges.slice(-3);
+  const oldExchanges = exchanges.slice(0, -3);
+  
+  // Create summary of old exchanges
+  const importantPoints = [];
+  const decisions = [];
+  const discoveries = [];
+  
+  for (let i = 0; i < oldExchanges.length; i++) {
+    const exchange = oldExchanges[i];
+    const userText = exchange.user;
+    const assistantText = exchange.assistant;
+    
+    // Extract important information
+    if (userText.includes('implement') || userText.includes('create') || userText.includes('build')) {
+      decisions.push('User requested: ' + userText.replace('USER: ', ''));
+    }
+    
+    if (assistantText.includes('--> Switch to') || assistantText.includes('mode')) {
+      decisions.push('Mode change: ' + assistantText.replace('ASSISTANT: ', '').split('\n')[0]);
+    }
+    
+    // Look for key decisions in tool results
+    for (let j = 0; j < exchange.other.length; j++) {
+      const otherLine = exchange.other[j];
+      if (otherLine.includes('Discovery') && otherLine.includes('importance')) {
+        discoveries.push(otherLine);
+      }
+      if (otherLine.includes('committed') || otherLine.includes('created')) {
+        decisions.push(otherLine);
+      }
+    }
+  }
+  
+  // Build compact summary
+  let summary = '=== CONVERSATION SUMMARY ===\n';
+  
+  if (decisions.length > 0) {
+    summary += 'KEY DECISIONS:\n';
+    for (let i = 0; i < Math.min(decisions.length, 5); i++) {
+      summary += '- ' + decisions[i] + '\n';
+    }
+    summary += '\n';
+  }
+  
+  if (discoveries.length > 0) {
+    summary += 'KEY DISCOVERIES:\n';
+    for (let i = 0; i < Math.min(discoveries.length, 3); i++) {
+      summary += '- ' + discoveries[i] + '\n';
+    }
+    summary += '\n';
+  }
+  
+  summary += '=== RECENT CONVERSATION ===\n';
+  
+  // Add recent exchanges
+  for (let i = 0; i < recentExchanges.length; i++) {
+    const exchange = recentExchanges[i];
+    if (exchange.user) summary += exchange.user + '\n';
+    if (exchange.assistant) summary += exchange.assistant + '\n';
+    for (let j = 0; j < exchange.other.length; j++) {
+      summary += exchange.other[j] + '\n';
+    }
+  }
+  
+  return summary;
+}
+
+function calculatePromptLength(basePrompt, modePrompt, goals, fileStructure, context, conversationHistory) {
+  return (basePrompt + modePrompt + goals + fileStructure + context + conversationHistory).length;
+}
+
 async function generateFileStructure() {
   let structure = await buildDirectoryTree(CODEBASE_PATH, 0);
   
@@ -418,6 +571,8 @@ module.exports = {
   getActiveSelection: getActiveSelection,
   getActiveMode: getActiveMode,
   parseToolBlocks: parseToolBlocks,
+  classifyTools: classifyTools,
+  validateResponseType: validateResponseType,
   replaceToolsWithIndicators: replaceToolsWithIndicators,
   validateMessageFormat: validateMessageFormat,
   hasMessageEnd: hasMessageEnd,
@@ -425,6 +580,8 @@ module.exports = {
   searchFilesByContent: searchFilesByContent,
   calculateImportanceWeight: calculateImportanceWeight,
   compactDiscoveries: compactDiscoveries,
+  compactConversation: compactConversation,
+  calculatePromptLength: calculatePromptLength,
   generateFileStructure: generateFileStructure,
   updateFileInStructure: updateFileInStructure,
   getFileStructure: getFileStructure,
@@ -463,6 +620,15 @@ async function buildPrompt() {
       conversationHistory = lines.slice(historyIndex + 1).join('\n').trim();
     }
     
+    // Check if we need to compact the conversation
+    const estimatedLength = utils.calculatePromptLength(basePrompt, modePrompt, goals, fileStructure, context, conversationHistory);
+    
+    if (estimatedLength > 500000 && conversationHistory.length > 10000) {
+      console.log('📝 Compacting conversation history...');
+      conversationHistory = utils.compactConversation(conversationHistory, 30000);
+      console.log('✓ Conversation compacted');
+    }
+    
     // Build prompt with conditional sections
     let prompt = basePrompt + '\n\n' + modePrompt + '\n\nGOALS:\n' + goals + '\n\nPROJECT STRUCTURE:\n' + fileStructure;
     
@@ -484,6 +650,9 @@ async function buildPrompt() {
     
     if (prompt.length > 500000) {
       console.log('⚠ Warning: Prompt is ' + prompt.length + ' chars, approaching 600k limit');
+      if (prompt.length > 550000) {
+        console.log('⚠ Consider running "npm run reset" if prompt becomes too large');
+      }
     }
     
   } catch (err) {
@@ -511,7 +680,7 @@ async function processResponse() {
       return;
     }
     
-    // Validate basic format (just needs [[[MESSAGE_END]]])
+    // Basic format validation
     try {
       utils.validateMessageFormat(responseText);
     } catch (formatError) {
@@ -520,56 +689,127 @@ async function processResponse() {
       return;
     }
     
-    // Parse tools from anywhere in the message
+    // Parse tools
     const tools = utils.parseToolBlocks(responseText);
     
-    // Replace tool calls with readable indicators in conversation
-    const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-    await updateConversation('ASSISTANT: ' + cleanResponse);
-    
-    // Separate tool types
-    const specialTools = tools.filter(function(t) {
-      return t.name === 'DISCOVERED' || t.name === 'SWITCH_TO' || 
-             t.name === 'EXPLORATION_FINDINGS' || t.name === 'DETAILED_PLAN';
-    });
-    
-    const fileTools = tools.filter(function(t) {
-      return t.name === 'READ_FILE' || t.name === 'SEARCH_FILES_BY_NAME' || 
-             t.name === 'SEARCH_FILES_BY_CONTENT' || t.name === 'CREATE_NEW_FILE' || 
-             t.name === 'UPDATE_FILE' || t.name === 'INSERT_LINES' || t.name === 'DELETE_FILE';
-    });
-    
-    // Handle special tools first
-    for (let i = 0; i < specialTools.length; i++) {
-      const tool = specialTools[i];
-      await handleSpecialTool(tool);
+    // Strict response type validation
+    const typeValidation = utils.validateResponseType(responseText, tools);
+    if (!typeValidation.valid) {
+      console.error('❌ Response Type Error:', typeValidation.error);
+      await handleResponseTypeError(typeValidation.error, responseText);
+      return;
     }
     
-    // Handle file operation tools
-    for (let i = 0; i < fileTools.length; i++) {
-      const tool = fileTools[i];
-      const result = await executeTool(tool);
-      
-      if (tool.name === 'UPDATE_FILE' || tool.name === 'INSERT_LINES') {
-        await requestFileConfirmation(tool, result);
-        return; // Wait for confirmation
-      }
-      
-      // Add tool result to conversation
-      const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-      await updateConversation('TOOL RESULT (' + tool.name + '): ' + resultText);
+    console.log('✓ Processing ' + typeValidation.type + ' response');
+    
+    // Handle based on response type
+    if (typeValidation.type === 'information') {
+      await handleInformationResponse(responseText, tools);
+    } else {
+      await handleResponseWithActions(responseText, tools);
     }
-    
-    const buildPrompt = require('./message-to-prompt').buildPrompt;
-    await buildPrompt();
-    console.log('✓ Next prompt ready in generated-prompt.md');
-    
-    await fs.writeFile('ai-response.md', '', 'utf8');
-    console.log('✓ Processed AI response');
     
   } catch (err) {
     console.error('Error processing response:', err);
   }
+}
+
+async function handleResponseTypeError(errorMessage, responseText) {
+  // Don't add the invalid response to conversation
+  
+  const errorResponse = 'SYSTEM ERROR: ' + errorMessage + '\n\n' +
+    'Response Type Rules:\n' +
+    '1. Information Gathering: Use ONLY read/search tools, NO text\n' +
+    '2. Response/Action: Use text and/or action tools, NO read/search tools\n\n' +
+    'Your last response violated these rules. Please try again with the correct response type.';
+  
+  await updateConversation(errorResponse);
+  await fs.writeFile('ai-response.md', '', 'utf8');
+  
+  const buildPrompt = require('./message-to-prompt').buildPrompt;
+  await buildPrompt();
+  console.log('✓ Error prompt ready in generated-prompt.md');
+}
+
+async function handleInformationResponse(responseText, tools) {
+  // For information gathering, just add the indicators to conversation
+  const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
+  await updateConversation('ASSISTANT: ' + cleanResponse);
+  
+  // Process all information gathering tools
+  for (let i = 0; i < tools.length; i++) {
+    const tool = tools[i];
+    const result = await executeTool(tool);
+    
+    // Add tool result to conversation
+    const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+    await updateConversation('TOOL RESULT (' + tool.name + '): ' + resultText);
+  }
+  
+  // Clear response and build next prompt
+  await fs.writeFile('ai-response.md', '', 'utf8');
+  const buildPrompt = require('./message-to-prompt').buildPrompt;
+  await buildPrompt();
+  console.log('✓ Information gathering complete, next prompt ready');
+}
+
+async function handleResponseWithActions(responseText, tools) {
+  // Replace tool calls with readable indicators in conversation
+  const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
+  await updateConversation('ASSISTANT: ' + cleanResponse);
+  
+  // Separate tool types
+  const specialTools = tools.filter(function(t) {
+    return t.name === 'DISCOVERED' || t.name === 'SWITCH_TO' || 
+           t.name === 'EXPLORATION_FINDINGS' || t.name === 'DETAILED_PLAN';
+  });
+  
+  const fileTools = tools.filter(function(t) {
+    return t.name === 'CREATE_NEW_FILE' || t.name === 'UPDATE_FILE' || 
+           t.name === 'INSERT_LINES' || t.name === 'DELETE_FILE';
+  });
+  
+  // Handle special tools first
+  for (let i = 0; i < specialTools.length; i++) {
+    const tool = specialTools[i];
+    await handleSpecialTool(tool);
+  }
+  
+  // Handle file operation tools
+  for (let i = 0; i < fileTools.length; i++) {
+    const tool = fileTools[i];
+    const result = await executeTool(tool);
+    
+    if (tool.name === 'UPDATE_FILE' || tool.name === 'INSERT_LINES') {
+      await requestFileConfirmation(tool, result);
+      return; // Wait for confirmation
+    }
+    
+    // Add tool result to conversation
+    const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+    await updateConversation('TOOL RESULT (' + tool.name + '): ' + resultText);
+  }
+  
+  await fs.writeFile('ai-response.md', '', 'utf8');
+  const buildPrompt = require('./message-to-prompt').buildPrompt;
+  await buildPrompt();
+  console.log('✓ Response processed, next prompt ready');
+}
+
+async function handleFormatError(errorMessage) {
+  const responseText = await utils.readFileIfExists('ai-response.md');
+  
+  // Add the malformed response to conversation so AI can see what went wrong
+  await updateConversation('ASSISTANT: ' + responseText);
+  
+  const errorResponse = 'SYSTEM ERROR: ' + errorMessage + '\n\nPlease fix your response format. Remember to end with [[[MESSAGE_END]]].';
+  
+  await updateConversation(errorResponse);
+  await fs.writeFile('ai-response.md', '', 'utf8');
+  
+  const buildPrompt = require('./message-to-prompt').buildPrompt;
+  await buildPrompt();
+  console.log('✓ Error prompt ready in generated-prompt.md');
 }
 
 async function handleSpecialTool(tool) {
@@ -604,41 +844,6 @@ async function saveAiDocument(type, params) {
   console.log('✓ Saved ' + type + ': ' + filename);
 }
 
-async function handleFormatError(errorMessage) {
-  const responseText = await utils.readFileIfExists('ai-response.md');
-  
-  // Add the malformed response to conversation so AI can see what went wrong
-  await updateConversation('ASSISTANT: ' + responseText);
-  
-  const errorResponse = 'SYSTEM ERROR: ' + errorMessage + '\n\nPlease fix your response format and try again. Remember:\n1. English response text\n2. ====TOOLS====\n3. @TOOL_NAME blocks only\n4. [[[MESSAGE_END]]]';
-  
-  await updateConversation(errorResponse);
-  await fs.writeFile('ai-response.md', '', 'utf8');
-  
-  const buildPrompt = require('./message-to-prompt').buildPrompt;
-  await buildPrompt();
-  console.log('✓ Error prompt ready in generated-prompt.md');
-}
-
-async function handleSpecialTool(tool) {
-  switch (tool.name) {
-    case 'DISCOVERED':
-      await handleDiscovery(tool.params);
-      break;
-    case 'SWITCH_TO':
-      await updateMode(tool.params.mode);
-      break;
-    case 'EXPLORATION_FINDINGS':
-      await fs.writeFile('ai-managed/exploration-findings.md', tool.params.content, 'utf8');
-      console.log('✓ Updated exploration findings');
-      break;
-    case 'DETAILED_PLAN':
-      await fs.writeFile('ai-managed/detailed-plan.md', tool.params.content, 'utf8');
-      console.log('✓ Updated implementation plan');
-      break;
-  }
-}
-
 async function handleDiscovery(params) {
   const importance = parseInt(params.importance) || 5;
   const content = params.content || '';
@@ -655,103 +860,6 @@ async function handleDiscovery(params) {
   console.log('✓ Added discovery (importance: ' + importance + ')');
 }
 
-async function handlePendingUpdate(responseText) {
-  const pendingData = JSON.parse(await fs.readFile('pending-changes.json', 'utf8'));
-  
-  if (responseText.includes('COMMIT')) {
-    await fs.writeFile(pendingData.filePath, pendingData.modifiedContent, 'utf8');
-    await fs.unlink('pending-changes.json');
-    
-    console.log('✓ Committed changes to ' + pendingData.file);
-    
-    await utils.updateFileInStructure();
-    await gitCommitAndPush(pendingData.file, pendingData.description);
-    
-    await updateConversation('ASSISTANT: Changes committed to ' + pendingData.file + ' and pushed to git');
-    await fs.writeFile('ai-response.md', '', 'utf8');
-    
-    const buildPrompt = require('./message-to-prompt').buildPrompt;
-    await buildPrompt();
-    console.log('✓ Next prompt ready in generated-prompt.md');
-    
-  } else {
-    const tools = utils.parseToolBlocks(responseText);
-    const fileOps = tools.filter(function(t) {
-      return t.name === 'UPDATE_FILE' || t.name === 'INSERT_LINES';
-    });
-    
-    if (fileOps.length > 0 && fileOps[0].params.file_name === pendingData.file) {
-      console.log('Processing new file operations for same file...');
-    } else {
-      console.log('⚠ Invalid response to pending update');
-    }
-  }
-}
-
-async function handleIncompleteMessage(responseText) {
-  // Add the incomplete response to conversation
-  await updateConversation('ASSISTANT: ' + responseText);
-  
-  const lastPart = responseText.slice(-50);
-  const continuation = 'Please continue from where you left off: "' + lastPart + '"';
-  
-  const conversation = await utils.readFileIfExists('conversation.md');
-  const updated = conversation.replace(
-    '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]',
-    '=== AI NEEDS TO CONTINUE ===\n' + continuation
-  );
-  
-  await fs.writeFile('conversation.md', updated, 'utf8');
-  console.log('⚠ Incomplete message detected, requesting continuation');
-  
-  const buildPrompt = require('./message-to-prompt').buildPrompt;
-  await buildPrompt();
-  console.log('✓ Continuation prompt ready in generated-prompt.md');
-}
-
-async function handleDiscovery(discoveryText) {
-  const lines = discoveryText.split('\n');
-  let importance = 5;
-  let content = discoveryText;
-  
-  const importanceMatch = lines[0].match(/^importance:\s*(\d+)$/);
-  if (importanceMatch) {
-    importance = parseInt(importanceMatch[1]);
-    content = lines.slice(1).join('\n').trim();
-  }
-  
-  const timestamp = new Date().toISOString().split('T')[0];
-  const discoveryEntry = '[' + timestamp + '] importance:' + importance + ' ' + content;
-  
-  const existingDiscoveries = await utils.readFileIfExists('ai-managed/discoveries.md');
-  const updated = existingDiscoveries + '\n' + discoveryEntry;
-  
-  const compacted = utils.compactDiscoveries(updated);
-  await fs.writeFile('ai-managed/discoveries.md', compacted, 'utf8');
-  
-  console.log('✓ Added discovery (importance: ' + importance + ')');
-}
-
-async function handleBlock(key, value) {
-  switch (key) {
-    case 'SWITCH_TO':
-      await updateMode(value);
-      break;
-    case 'DETAILED_PLAN':
-      await fs.writeFile('ai-managed/detailed-plan.md', value, 'utf8');
-      console.log('✓ Updated implementation plan');
-      break;
-    case 'EXPLORATION_FINDINGS':
-      await fs.writeFile('ai-managed/exploration-findings.md', value, 'utf8');
-      console.log('✓ Updated exploration findings');
-      break;
-    default:
-      const filename = 'ai-managed/' + key.toLowerCase() + '.md';
-      await fs.writeFile(filename, value, 'utf8');
-      console.log('✓ Updated ' + filename);
-  }
-}
-
 async function updateMode(newMode) {
   const modeContent = await utils.readFileIfExists('mode.md');
   const lines = modeContent.split('\n');
@@ -771,60 +879,6 @@ async function updateMode(newMode) {
   
   await fs.writeFile('mode.md', updated.join('\n'), 'utf8');
   console.log('✓ Switched to ' + newMode + ' mode');
-}
-
-async function handleTools(tools) {
-  for (let i = 0; i < tools.length; i++) {
-    const tool = tools[i];
-    if (tool.name === 'COMMIT') {
-      continue;
-    }
-    
-    const result = await executeTool(tool);
-    
-    if (tool.name === 'UPDATE_FILE' || tool.name === 'INSERT_LINES') {
-      await requestFileConfirmation(tool, result);
-      return;
-    }
-    
-    await addToolResult(tool, result);
-  }
-}
-
-async function updateMode(newMode) {
-  const modeContent = await utils.readFileIfExists('mode.md');
-  const lines = modeContent.split('\n');
-  
-  const updated = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    if (trimmed === newMode) {
-      updated.push('x ' + newMode);
-    } else if (line.startsWith('x ')) {
-      updated.push('  ' + line.slice(2));
-    } else {
-      updated.push(line);
-    }
-  }
-  
-  await fs.writeFile('mode.md', updated.join('\n'), 'utf8');
-  console.log('✓ Switched to ' + newMode + ' mode');
-}
-
-async function handleTools(tools) {
-  for (let i = 0; i < tools.length; i++) {
-    const tool = tools[i];
-    
-    const result = await executeTool(tool);
-    
-    if (tool.name === 'UPDATE_FILE' || tool.name === 'INSERT_LINES') {
-      await requestFileConfirmation(tool, result);
-      return;
-    }
-    
-    await addToolResult(tool, result);
-  }
 }
 
 async function executeTool(tool) {
@@ -845,57 +899,6 @@ async function executeTool(tool) {
       return await executeDeleteFile(tool.params);
     default:
       return 'Unknown tool: ' + tool.name;
-  }
-}
-
-async function handlePendingUpdate(responseText) {
-  const pendingData = JSON.parse(await fs.readFile('pending-changes.json', 'utf8'));
-  
-  // Check for @COMMIT tool in the new format
-  const tools = utils.parseToolBlocks(responseText);
-  const commitTool = tools.find(function(t) { return t.name === 'COMMIT'; });
-  
-  if (commitTool || responseText.includes('COMMIT')) {
-    // Add the commit response to conversation first
-    await updateConversation('ASSISTANT: ' + responseText);
-    
-    await fs.writeFile(pendingData.filePath, pendingData.modifiedContent, 'utf8');
-    await fs.unlink('pending-changes.json');
-    
-    console.log('✓ Committed changes to ' + pendingData.file);
-    
-    await utils.updateFileInStructure();
-    await gitCommitAndPush(pendingData.file, pendingData.description);
-    
-    await updateConversation('SYSTEM: Changes committed to ' + pendingData.file + ' and pushed to git');
-    await fs.writeFile('ai-response.md', '', 'utf8');
-    
-    const buildPrompt = require('./message-to-prompt').buildPrompt;
-    await buildPrompt();
-    console.log('✓ Next prompt ready in generated-prompt.md');
-    
-  } else {
-    await updateConversation('ASSISTANT: ' + responseText);
-    
-    const fileOps = tools.filter(function(t) {
-      return t.name === 'UPDATE_FILE' || t.name === 'INSERT_LINES';
-    });
-    
-    if (fileOps.length > 0 && fileOps[0].params.file_name === pendingData.file) {
-      console.log('Processing new file operations for same file...');
-      // Process the new file operations
-      for (let i = 0; i < fileOps.length; i++) {
-        const result = await executeTool(fileOps[i]);
-        await requestFileConfirmation(fileOps[i], result);
-        return;
-      }
-    } else {
-      await updateConversation('SYSTEM: Invalid response to pending update. Please use @COMMIT or provide corrected @UPDATE_FILE/@INSERT_LINES for ' + pendingData.file);
-      
-      const buildPrompt = require('./message-to-prompt').buildPrompt;
-      await buildPrompt();
-      console.log('✓ Error prompt ready in generated-prompt.md');
-    }
   }
 }
 
@@ -1038,13 +1041,9 @@ async function executeDeleteFile(params) {
 
 async function requestFileConfirmation(tool, result) {
   if (typeof result === 'string') {
-    await addToolResult(tool, result);
+    await updateConversation('TOOL RESULT (' + tool.name + '): ' + result);
     return;
   }
-  
-  // First add the original AI response to conversation
-  const responseText = await utils.readFileIfExists('ai-response.md');
-  await updateConversation('ASSISTANT: ' + responseText);
   
   const originalContent = result.originalContent;
   const modifiedContent = result.modifiedContent; 
@@ -1099,15 +1098,55 @@ async function requestFileConfirmation(tool, result) {
   console.log('⚠ File operation pending confirmation: ' + tool.params.file_name);
 }
 
-async function addToolResult(tool, result) {
-  const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+async function handlePendingUpdate(responseText) {
+  const pendingData = JSON.parse(await fs.readFile('pending-changes.json', 'utf8'));
   
-  const toolSummary = 'ASSISTANT: Tool ' + tool.name + ' executed:\n' + resultText;
-  await updateConversation(toolSummary);
+  // Check for @COMMIT tool in the new format
+  const tools = utils.parseToolBlocks(responseText);
+  const commitTool = tools.find(function(t) { return t.name === 'COMMIT'; });
   
-  const buildPrompt = require('./message-to-prompt').buildPrompt;
-  await buildPrompt();
-  console.log('✓ Next prompt ready in generated-prompt.md');
+  if (commitTool || responseText.includes('COMMIT')) {
+    // Add the commit response to conversation first
+    await updateConversation('ASSISTANT: ' + responseText);
+    
+    await fs.writeFile(pendingData.filePath, pendingData.modifiedContent, 'utf8');
+    await fs.unlink('pending-changes.json');
+    
+    console.log('✓ Committed changes to ' + pendingData.file);
+    
+    await utils.updateFileInStructure();
+    await gitCommitAndPush(pendingData.file, pendingData.description);
+    
+    await updateConversation('SYSTEM: Changes committed to ' + pendingData.file + ' and pushed to git');
+    await fs.writeFile('ai-response.md', '', 'utf8');
+    
+    const buildPrompt = require('./message-to-prompt').buildPrompt;
+    await buildPrompt();
+    console.log('✓ Next prompt ready in generated-prompt.md');
+    
+  } else {
+    await updateConversation('ASSISTANT: ' + responseText);
+    
+    const fileOps = tools.filter(function(t) {
+      return t.name === 'UPDATE_FILE' || t.name === 'INSERT_LINES';
+    });
+    
+    if (fileOps.length > 0 && fileOps[0].params.file_name === pendingData.file) {
+      console.log('Processing new file operations for same file...');
+      // Process the new file operations
+      for (let i = 0; i < fileOps.length; i++) {
+        const result = await executeTool(fileOps[i]);
+        await requestFileConfirmation(fileOps[i], result);
+        return;
+      }
+    } else {
+      await updateConversation('SYSTEM: Invalid response to pending update. Please use @COMMIT or provide corrected @UPDATE_FILE/@INSERT_LINES for ' + pendingData.file);
+      
+      const buildPrompt = require('./message-to-prompt').buildPrompt;
+      await buildPrompt();
+      console.log('✓ Error prompt ready in generated-prompt.md');
+    }
+  }
 }
 
 async function updateConversation(newMessage) {
@@ -1281,3 +1320,78 @@ if (require.main === module) {
 }
 
 module.exports = { startWatching: startWatching };
+
+// ==========================================
+
+// reset.js
+const fs = require('fs').promises;
+const path = require('path');
+const utils = require('./utils');
+
+async function reset() {
+  console.log('🔄 Resetting AI workflow...');
+  
+  try {
+    // Files to reset completely
+    const filesToClear = [
+      'conversation.md',
+      'ai-response.md',
+      'generated-prompt.md',
+      'pending-changes.json',
+      'ai-managed/context.md',
+      'ai-managed/discoveries.md',
+      'ai-managed/exploration-findings.md',
+      'ai-managed/detailed-plan.md'
+    ];
+    
+    for (let i = 0; i < filesToClear.length; i++) {
+      const file = filesToClear[i];
+      try {
+        if (file === 'conversation.md') {
+          await fs.writeFile(file, '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===', 'utf8');
+        } else if (file === 'pending-changes.json') {
+          await fs.unlink(file).catch(() => {}); // Delete if exists, ignore if not
+        } else {
+          await fs.writeFile(file, '', 'utf8');
+        }
+        console.log('✓ Reset ' + file);
+      } catch (err) {
+        // File might not exist, that's ok
+      }
+    }
+    
+    // Reset mode to exploration
+    await fs.writeFile('mode.md', 'x exploration\n  planning\n  implementation', 'utf8');
+    console.log('✓ Reset mode to exploration');
+    
+    // Keep goals.md and prompt files intact
+    console.log('✓ Preserved goals.md and prompt templates');
+    
+    // Optional: clear ai-docs folder
+    const aiDocsPath = path.join(__dirname, 'ai-docs');
+    try {
+      const files = await fs.readdir(aiDocsPath);
+      if (files.length > 0) {
+        console.log('\n📁 AI documents found in ai-docs/:');
+        for (let i = 0; i < files.length; i++) {
+          console.log('  - ' + files[i]);
+        }
+        console.log('\nThese were NOT deleted. Delete manually if needed.');
+      }
+    } catch (err) {
+      // ai-docs doesn't exist, that's fine
+    }
+    
+    console.log('\n✅ Reset complete! Ready for a fresh start.');
+    console.log('💡 Edit conversation.md to begin');
+    
+  } catch (err) {
+    console.error('❌ Error during reset:', err);
+  }
+}
+
+if (require.main === module) {
+  reset();
+}
+
+module.exports = { reset: reset };
