@@ -307,19 +307,8 @@ function validateResponseType(text, tools) {
 }
 
 function replaceToolsWithIndicators(text, tools) {
-  // For assistant messages, we want to preserve the box format but ensure proper wrapping
-  let cleanText = text.trim();
-  
-  // If the text already has the box format, extract and re-wrap the content
-  const boxMatch = cleanText.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
-  if (boxMatch) {
-    const content = boxMatch[1];
-    // Re-wrap the content to ensure consistent width
-    return formatInBox(content, 70);
-  }
-  
-  // If no box format found, just return the cleaned text
-  return cleanText;
+  // For assistant messages, preserve the original box format as-is
+  return text.trim();
 }
 
 function hasBoxClosure(text) {
