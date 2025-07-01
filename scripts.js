@@ -694,6 +694,7 @@ async function handleResponseTypeError(errorMessage, responseText) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
+  await updateConversationForPrompt();
   console.log('✓ Error prompt ready in generated-prompt.md');
 }
 
@@ -716,6 +717,7 @@ async function handleReadResponse(responseText, tools) {
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
+  await updateConversationForPrompt();
   console.log('✓ Read operations complete, next prompt ready');
 }
 
@@ -766,6 +768,7 @@ async function handleWriteResponse(responseText, tools) {
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
+  await updateConversationForPrompt();
   console.log('✓ Write response processed, next prompt ready');
 }
 
@@ -786,6 +789,7 @@ async function handleFormatError(errorMessage) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
+  await updateConversationForPrompt();
   console.log('✓ Error prompt ready in generated-prompt.md');
 }
 
@@ -806,6 +810,7 @@ async function handleIncompleteMessage(responseText) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
+  await updateConversationForPrompt();
   console.log('✓ Continuation prompt ready in generated-prompt.md');
 }
 
@@ -1132,6 +1137,7 @@ async function requestFileConfirmation(tool, result) {
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
+  await updateConversationForPrompt();
   console.log('✓ Confirmation prompt ready in generated-prompt.md');
   
   console.log('⚠ File operation pending confirmation: ' + tool.params.file_name);
@@ -1168,6 +1174,7 @@ async function handlePendingUpdate(responseText) {
     
     const buildPrompt = require('./message-to-prompt').buildPrompt;
     await buildPrompt();
+    await updateConversationForPrompt();
     console.log('✓ Next prompt ready in generated-prompt.md');
     
   } else {
@@ -1191,8 +1198,23 @@ async function handlePendingUpdate(responseText) {
       
       const buildPrompt = require('./message-to-prompt').buildPrompt;
       await buildPrompt();
+      await updateConversationForPrompt();
       console.log('✓ Error prompt ready in generated-prompt.md');
     }
+  }
+}
+
+async function updateConversationForPrompt() {
+  const conversation = await utils.readFileIfExists('conversation.md');
+  
+  const lines = conversation.split('\n');
+  const waitingIndex = lines.findIndex(function(line) { return line.includes('=== WAITING FOR YOUR MESSAGE ==='); });
+  
+  if (waitingIndex !== -1) {
+    lines[waitingIndex] = '=== AI RESPONSE READY ===';
+    lines[waitingIndex + 1] = 'Copy the contents of generated-prompt.md and submit to AI';
+    
+    await fs.writeFile('conversation.md', lines.join('\n'), 'utf8');
   }
 }
 
