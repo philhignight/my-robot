@@ -708,6 +708,33 @@ function wrapSystemMessage(content) {
   return wrapped.join('\n');
 }
 
+function fixBoxPadding(text) {
+  const lines = text.split('\n');
+  const fixedLines = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    if (line.includes('┌─ ASSISTANT')) {
+      // Top border - ensure it's exactly 70 chars
+      const prefix = '┌─ ASSISTANT ';
+      fixedLines.push(prefix + '─'.repeat(70 - prefix.length - 1) + '┐');
+    } else if (line.includes('└─')) {
+      // Bottom border
+      fixedLines.push('└' + '─'.repeat(68) + '┘');
+    } else if (line.startsWith('│')) {
+      // Content line - ensure proper padding
+      const content = line.substring(1).replace(/\s*│\s*$/, '');
+      const paddedContent = content + ' '.repeat(Math.max(0, 68 - content.length));
+      fixedLines.push('│' + paddedContent + ' │');
+    } else {
+      fixedLines.push(line);
+    }
+  }
+  
+  return fixedLines.join('\n');
+}
+
 module.exports = {
   CODEBASE_PATH: CODEBASE_PATH,
   ensureDir: ensureDir,
@@ -731,7 +758,8 @@ module.exports = {
   getCodebasePath: getCodebasePath,
   wrapText: wrapText,
   formatInBox: formatInBox,
-  wrapSystemMessage: wrapSystemMessage
+  wrapSystemMessage: wrapSystemMessage,
+  fixBoxPadding: fixBoxPadding
 };
 
 // ==========================================
@@ -823,7 +851,13 @@ async function processResponse() {
     try {
       utils.validateMessageFormat(responseText);
     } catch (formatError) {
-      if (formatError.message.includes('complete ASCII box')) {
+      if (formatError.message.includes('complete ASCII box') && !responseText.includes('┌─ ASSISTANT')) {
+        // Missing box entirely
+        console.error('❌ Format Error:', formatError.message);
+        await handleFormatError(formatError.message);
+        return;
+      } else if (formatError.message.includes('complete ASCII box')) {
+        // Has box start but missing closure - incomplete message
         console.log('⚠ Incomplete message detected, requesting continuation');
         await handleIncompleteMessage(responseText);
         return;
@@ -859,7 +893,9 @@ async function processResponse() {
 }
 
 async function handleResponseTypeError(errorMessage, responseText) {
-  // Don't add the invalid response to conversation
+  // Add the invalid response to conversation so AI can see what went wrong
+  const cleanResponse = utils.replaceToolsWithIndicators(responseText, []);
+  await updateConversation(cleanResponse);
   
   const errorResponse = 'SYSTEM: ERROR - ' + errorMessage + '\n\n' +
     'Response Rules:\n' +
@@ -1085,41 +1121,62 @@ async function executeTool(tool) {
 async function executeListDirectory(params) {
   try {
     const dirPath = utils.getCodebasePath(params.path || '.');
-    const entries = await fs.readdir(dirPath, { withFileTypes: true });
     
-    const dirs = [];
-    const files = [];
-    
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
-      if (entry.name.startsWith('.')) continue;
+    async function buildTree(dir, prefix) {
+      let result = '';
+      const entries = await fs.readdir(dir, { withFileTypes: true });
       
-      if (entry.isDirectory()) {
-        const subPath = path.join(dirPath, entry.name);
-        const fileCount = await utils.countFilesInDir(subPath);
-        dirs.push(entry.name + '/ (' + fileCount + ' files)');
-      } else {
-        const filePath = path.join(dirPath, entry.name);
-        const lineCount = await utils.getLineCount(filePath);
-        files.push(entry.name + ' (' + lineCount + ' lines)');
+      // Separate and sort directories and files
+      const dirs = [];
+      const files = [];
+      
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.name.startsWith('.')) continue;
+        
+        if (entry.isDirectory()) {
+          dirs.push(entry.name);
+        } else {
+          files.push(entry.name);
+        }
       }
-    }
-    
-    let result = 'Contents of ' + (params.path || '.') + ':\n';
-    if (dirs.length > 0) {
-      result += 'Directories:\n';
+      
+      dirs.sort();
+      files.sort();
+      
+      // Process directories
       for (let i = 0; i < dirs.length; i++) {
-        result += '  ' + dirs[i] + '\n';
+        const dirName = dirs[i];
+        const isLast = (i === dirs.length - 1 && files.length === 0);
+        const subPath = path.join(dir, dirName);
+        
+        result += prefix + (isLast ? '└── ' : '├── ') + dirName + '/\n';
+        
+        // Recursively build subtree
+        const subTree = await buildTree(subPath, prefix + (isLast ? '    ' : '│   '));
+        result += subTree;
       }
-    }
-    if (files.length > 0) {
-      result += 'Files:\n';
+      
+      // Process files
       for (let i = 0; i < files.length; i++) {
-        result += '  ' + files[i] + '\n';
+        const fileName = files[i];
+        const isLast = (i === files.length - 1);
+        const filePath = path.join(dir, fileName);
+        const lineCount = await utils.getLineCount(filePath);
+        
+        result += prefix + (isLast ? '└── ' : '├── ') + fileName + ' (' + lineCount + ' lines)\n';
       }
+      
+      return result;
     }
     
-    if (dirs.length === 0 && files.length === 0) {
+    const rootName = params.path || '.';
+    let result = 'Contents of ' + rootName + ':\n';
+    
+    const tree = await buildTree(dirPath, '');
+    if (tree) {
+      result += tree;
+    } else {
       result += '[Empty directory]';
     }
     
@@ -1408,37 +1465,66 @@ async function updateConversation(newMessage) {
   // Apply wrapping based on message type
   let wrappedMessage = newMessage;
   if (newMessage.startsWith('SYSTEM:')) {
-    // Wrap system messages
-    const content = newMessage.slice('SYSTEM:'.length).trim();
-    const wrapped = utils.wrapSystemMessage(content);
-    wrappedMessage = 'SYSTEM: ' + wrapped.split('\n').join('\n        '); // Indent continuation lines
+    // Wrap system messages without continuation markers
+    const lines = newMessage.split('\n');
+    const wrappedLines = [];
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (i === 0) {
+        // First line with SYSTEM: prefix
+        const content = line.slice('SYSTEM:'.length).trim();
+        const wrapped = utils.wrapText(content, 62); // Leave room for "SYSTEM: "
+        wrappedLines.push('SYSTEM: ' + wrapped[0]);
+        for (let j = 1; j < wrapped.length; j++) {
+          wrappedLines.push('        ' + wrapped[j].replace(/^\.\.\.+ /, '')); // Remove ... and indent
+        }
+      } else {
+        // Subsequent lines
+        const wrapped = utils.wrapText(line, 62);
+        for (let j = 0; j < wrapped.length; j++) {
+          wrappedLines.push('        ' + wrapped[j].replace(/^\.\.\.+ /, ''));
+        }
+      }
+    }
+    wrappedMessage = wrappedLines.join('\n');
   } else if (newMessage.startsWith('> ')) {
-    // Wrap user messages
+    // Wrap user messages without continuation markers
     const content = newMessage.slice(2);
-    const wrapped = utils.wrapText(content, 70);
-    wrappedMessage = '> ' + wrapped.join('\n  '); // Indent continuation lines
+    const wrapped = utils.wrapText(content, 68); // Leave room for "> "
+    const cleanWrapped = wrapped.map(function(line) {
+      return line.replace(/^\.\.\.+ /, '');
+    });
+    wrappedMessage = '> ' + cleanWrapped.join('\n  '); // Simple indent for continuation
+  } else if (newMessage.includes('┌─ ASSISTANT')) {
+    // Fix padding in assistant messages (they keep ... for continuation)
+    wrappedMessage = utils.fixBoxPadding(newMessage);
   }
-  // Assistant messages are already in box format from replaceToolsWithIndicators
   
   const lines = conversation.split('\n');
   const historyIndex = lines.findIndex(function(line) { return line.includes('=== CONVERSATION HISTORY ==='); });
+  const waitingIndex = lines.findIndex(function(line) { return line.includes('=== WAITING FOR YOUR MESSAGE ==='); });
   
   if (historyIndex === -1) {
-    const updated = '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n\n' + wrappedMessage;
+    const updated = '=== CONVERSATION HISTORY ===\n\n' + wrappedMessage + '\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]';
     await fs.writeFile('conversation.md', updated, 'utf8');
   } else {
-    const before = lines.slice(0, historyIndex + 1);
-    const after = lines.slice(historyIndex + 1);
+    let historyContent = '';
     
-    // Append to the end of the conversation (newest at bottom)
-    const existingHistory = after.join('\n');
-    const newHistory = existingHistory + (existingHistory.trim() ? '\n\n' : '') + wrappedMessage;
+    // Extract existing history
+    if (waitingIndex > historyIndex) {
+      historyContent = lines.slice(historyIndex + 1, waitingIndex).join('\n').trim();
+    } else {
+      historyContent = lines.slice(historyIndex + 1).join('\n').trim();
+    }
     
-    const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', '']
-      .concat(before.slice(historyIndex))
-      .concat([newHistory]);
+    // Append new message to history
+    const newHistory = historyContent + (historyContent ? '\n\n' : '') + wrappedMessage;
     
-    await fs.writeFile('conversation.md', updated.join('\n'), 'utf8');
+    // Rebuild file with input area at bottom
+    const updated = '=== CONVERSATION HISTORY ===\n\n' + newHistory + '\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]';
+    
+    await fs.writeFile('conversation.md', updated, 'utf8');
   }
 }
 
@@ -1505,28 +1591,27 @@ async function moveMessageToHistory(message) {
   const lines = conversation.split('\n');
   
   const historyIndex = lines.findIndex(function(line) { return line.includes('=== CONVERSATION HISTORY ==='); });
+  const waitingIndex = lines.findIndex(function(line) { return line.includes('=== WAITING FOR YOUR MESSAGE ==='); });
   
-  if (historyIndex !== -1) {
-    const before = lines.slice(0, historyIndex + 1);
-    const after = lines.slice(historyIndex + 1);
+  if (historyIndex !== -1 && waitingIndex !== -1) {
+    // Extract existing history (between the two markers)
+    const historyContent = lines.slice(historyIndex + 1, waitingIndex).join('\n').trim();
     
-    // Append to the end of the conversation (newest at bottom)
-    const existingHistory = after.join('\n');
+    // Append user message to history
     const userMessage = '> ' + message;
-    const newHistory = existingHistory + (existingHistory.trim() ? '\n\n' : '') + userMessage;
+    const newHistory = historyContent + (historyContent ? '\n\n' : '') + userMessage;
     
-    const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', '']
-      .concat(before.slice(historyIndex))
-      .concat([newHistory]);
+    // Rebuild file with input area at bottom
+    const updated = '=== CONVERSATION HISTORY ===\n\n' + newHistory + '\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]';
     
-    await require('fs').promises.writeFile('conversation.md', updated.join('\n'), 'utf8');
+    await require('fs').promises.writeFile('conversation.md', updated, 'utf8');
     console.log('✓ Moved user message to history');
   }
 }
 
 async function createInitialFiles() {
   const initialFiles = {
-    'conversation.md': '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n',
+    'conversation.md': '=== CONVERSATION HISTORY ===\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]',
     'mode.md': 'x exploration\n  planning\n  implementation',
     'goals.md': '# Project Goals\n\nAdd your high-level objectives here',
     'ai-response.md': '',
@@ -1625,7 +1710,7 @@ async function reset() {
       const file = filesToClear[i];
       try {
         if (file === 'conversation.md') {
-          await fs.writeFile(file, '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n', 'utf8');
+          await fs.writeFile(file, '=== CONVERSATION HISTORY ===\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]', 'utf8');
         } else if (file === 'pending-changes.json') {
           await fs.unlink(file).catch(() => {}); // Delete if exists, ignore if not
         } else {
