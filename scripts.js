@@ -154,12 +154,16 @@ function validateResponseType(text, tools) {
 function replaceToolsWithIndicators(text, tools) {
   let result = text;
   
+  // Remove MESSAGE_END marker first
+  result = result.replace(/\[\[\[MESSAGE_END\]\]\]/g, '').trim();
+  
   // Sort tools by start index in reverse order so we can replace from end to beginning
   const sortedTools = tools.slice().sort(function(a, b) { return b.startIndex - a.startIndex; });
   
   for (let i = 0; i < sortedTools.length; i++) {
     const tool = sortedTools[i];
     let indicator = '';
+    let explanation = '';
     
     switch (tool.name) {
       case 'RESPONSE_MESSAGE':
@@ -167,50 +171,50 @@ function replaceToolsWithIndicators(text, tools) {
         indicator = tool.params.content || '[Empty message]';
         break;
       case 'LIST_DIRECTORY':
-        indicator = '--> List directory: ' + (tool.params.path || '.') +
-          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
+        explanation = tool.params.explanation || 'Listing directory';
+        indicator = explanation + '\n[LIST] ' + (tool.params.path || '.');
         break;
       case 'READ_FILE':
-        indicator = '--> Read file: ' + tool.params.file_name + 
-          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
+        explanation = tool.params.explanation || 'Reading file';
+        indicator = explanation + '\n[READ] ' + tool.params.file_name;
         break;
       case 'SEARCH_FILES_BY_NAME':
-        indicator = '--> Search files by name: ' + tool.params.regex + ' in ' + tool.params.folder +
-          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
+        explanation = tool.params.explanation || 'Searching files by name';
+        indicator = explanation + '\n[SEARCH_NAME] ' + tool.params.regex + ' in ' + tool.params.folder;
         break;
       case 'SEARCH_FILES_BY_CONTENT':
-        indicator = '--> Search files by content: ' + tool.params.regex + ' in ' + tool.params.folder +
-          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
+        explanation = tool.params.explanation || 'Searching files by content';
+        indicator = explanation + '\n[SEARCH_CONTENT] ' + tool.params.regex + ' in ' + tool.params.folder;
         break;
       case 'CREATE_NEW_FILE':
-        indicator = '--> Create file: ' + tool.params.path;
+        indicator = 'Creating new file\n[CREATE] ' + tool.params.path;
         break;
       case 'UPDATE_FILE':
-        indicator = '--> Update file: ' + tool.params.file_name + ' (lines ' + tool.params.start_line + '-' + tool.params.end_line + ')';
+        indicator = tool.params.change_description + '\n[UPDATE] ' + tool.params.file_name + ' (lines ' + tool.params.start_line + '-' + tool.params.end_line + ')';
         break;
       case 'INSERT_LINES':
-        indicator = '--> Insert lines: ' + tool.params.file_name + ' at line ' + tool.params.line_number;
+        indicator = tool.params.change_description + '\n[INSERT] ' + tool.params.file_name + ' at line ' + tool.params.line_number;
         break;
       case 'DELETE_FILE':
-        indicator = '--> Delete file: ' + tool.params.file_name;
+        indicator = 'Deleting file\n[DELETE] ' + tool.params.file_name;
         break;
       case 'DISCOVERED':
-        indicator = '--> Discovery (importance ' + tool.params.importance + '): ' + tool.params.content;
+        indicator = 'Discovery (importance ' + tool.params.importance + '):\n' + tool.params.content;
         break;
       case 'SWITCH_TO':
-        indicator = '--> Switch to ' + tool.params.mode + ' mode';
+        indicator = 'Switching to ' + tool.params.mode + ' mode';
         break;
       case 'EXPLORATION_FINDINGS':
-        indicator = '--> Save exploration findings: ' + (tool.params.name || 'findings');
+        indicator = 'Saving exploration findings: ' + (tool.params.name || 'findings');
         break;
       case 'DETAILED_PLAN':
-        indicator = '--> Save implementation plan: ' + (tool.params.name || 'plan');
+        indicator = 'Saving implementation plan: ' + (tool.params.name || 'plan');
         break;
       case 'COMMIT':
-        indicator = '--> Commit changes';
+        indicator = 'Committing changes';
         break;
       default:
-        indicator = '--> ' + tool.name + ' tool used';
+        indicator = tool.name + ' tool used';
     }
     
     result = result.slice(0, tool.startIndex) + indicator + result.slice(tool.endIndex);
@@ -640,6 +644,11 @@ async function processResponse() {
     try {
       utils.validateMessageFormat(responseText);
     } catch (formatError) {
+      if (formatError.message.includes('Missing [[[MESSAGE_END]]]')) {
+        console.log('⚠ Incomplete message detected, requesting continuation');
+        await handleIncompleteMessage(responseText);
+        return;
+      }
       console.error('❌ Format Error:', formatError.message);
       await handleFormatError(formatError.message);
       return;
@@ -673,7 +682,7 @@ async function processResponse() {
 async function handleResponseTypeError(errorMessage, responseText) {
   // Don't add the invalid response to conversation
   
-  const errorResponse = 'SYSTEM ERROR: ' + errorMessage + '\n\n' +
+  const errorResponse = 'SYSTEM ERROR:\n' + errorMessage + '\n\n' +
     'Response Rules:\n' +
     '1. READ Response: Use ONLY read/search/list tools, NO other content\n' +
     '2. WRITE Response: Use @RESPONSE_MESSAGE for text and/or action tools\n' +
@@ -691,7 +700,7 @@ async function handleResponseTypeError(errorMessage, responseText) {
 async function handleReadResponse(responseText, tools) {
   // For read responses, just add the indicators to conversation
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-  await updateConversation('ASSISTANT: ' + cleanResponse);
+  await updateConversation('ASSISTANT:\n' + cleanResponse);
   
   // Process all read tools
   for (let i = 0; i < tools.length; i++) {
@@ -700,7 +709,7 @@ async function handleReadResponse(responseText, tools) {
     
     // Add tool result to conversation
     const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-    await updateConversation('TOOL RESULT (' + tool.name + '): ' + resultText);
+    await updateConversation('TOOL RESULT (' + tool.name + '):\n' + resultText);
   }
   
   // Clear response and build next prompt
@@ -713,7 +722,7 @@ async function handleReadResponse(responseText, tools) {
 async function handleWriteResponse(responseText, tools) {
   // Replace tool calls with readable indicators in conversation
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-  await updateConversation('ASSISTANT: ' + cleanResponse);
+  await updateConversation('ASSISTANT:\n' + cleanResponse);
   
   // Separate tool types
   const messageTools = tools.filter(function(t) {
@@ -751,7 +760,7 @@ async function handleWriteResponse(responseText, tools) {
     
     // Add tool result to conversation
     const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-    await updateConversation('TOOL RESULT (' + tool.name + '): ' + resultText);
+    await updateConversation('TOOL RESULT (' + tool.name + '):\n' + resultText);
   }
   
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -763,10 +772,14 @@ async function handleWriteResponse(responseText, tools) {
 async function handleFormatError(errorMessage) {
   const responseText = await utils.readFileIfExists('ai-response.md');
   
-  // Add the malformed response to conversation so AI can see what went wrong
-  await updateConversation('ASSISTANT: ' + responseText);
+  // Parse tools and clean the response
+  const tools = utils.parseToolBlocks(responseText);
+  const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   
-  const errorResponse = 'SYSTEM ERROR: ' + errorMessage + '\n\nPlease fix your response format. Remember to end with [[[MESSAGE_END]]].';
+  // Add the malformed response to conversation so AI can see what went wrong
+  await updateConversation('ASSISTANT:\n' + cleanResponse);
+  
+  const errorResponse = 'SYSTEM ERROR:\n' + errorMessage + '\n\nPlease fix your response format. Remember to end with [[[MESSAGE_END]]].';
   
   await updateConversation(errorResponse);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -774,6 +787,26 @@ async function handleFormatError(errorMessage) {
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
   console.log('✓ Error prompt ready in generated-prompt.md');
+}
+
+async function handleIncompleteMessage(responseText) {
+  // Parse tools and clean the response
+  const tools = utils.parseToolBlocks(responseText);
+  const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
+  
+  // Add the incomplete response to conversation
+  await updateConversation('ASSISTANT:\n' + cleanResponse);
+  
+  // Get the last 100 characters to show context
+  const lastPart = responseText.slice(-100);
+  const continuationRequest = 'SYSTEM:\nYour message was cut off. Please continue from where you left off: "' + lastPart + '"\n\nRemember to end with [[[MESSAGE_END]]].';
+  
+  await updateConversation(continuationRequest);
+  await fs.writeFile('ai-response.md', '', 'utf8');
+  
+  const buildPrompt = require('./message-to-prompt').buildPrompt;
+  await buildPrompt();
+  console.log('✓ Continuation prompt ready in generated-prompt.md');
 }
 
 async function handleSpecialTool(tool) {
@@ -1047,7 +1080,7 @@ async function executeDeleteFile(params) {
 
 async function requestFileConfirmation(tool, result) {
   if (typeof result === 'string') {
-    await updateConversation('TOOL RESULT (' + tool.name + '): ' + result);
+    await updateConversation('TOOL RESULT (' + tool.name + '):\n' + result);
     return;
   }
   
@@ -1094,7 +1127,7 @@ async function requestFileConfirmation(tool, result) {
   
   await fs.writeFile('pending-changes.json', JSON.stringify(pendingData, null, 2), 'utf8');
   
-  await updateConversation('SYSTEM: ' + confirmation);
+  await updateConversation('SYSTEM:\n' + confirmation);
   await fs.writeFile('ai-response.md', '', 'utf8');
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
@@ -1105,6 +1138,13 @@ async function requestFileConfirmation(tool, result) {
 }
 
 async function handlePendingUpdate(responseText) {
+  // Check if message is complete
+  if (!utils.hasMessageEnd(responseText)) {
+    console.log('⚠ Incomplete message during pending update, requesting continuation');
+    await handleIncompleteMessage(responseText);
+    return;
+  }
+  
   const pendingData = JSON.parse(await fs.readFile('pending-changes.json', 'utf8'));
   
   // Check for @COMMIT tool in the new format
@@ -1112,8 +1152,9 @@ async function handlePendingUpdate(responseText) {
   const commitTool = tools.find(function(t) { return t.name === 'COMMIT'; });
   
   if (commitTool || responseText.includes('COMMIT')) {
-    // Add the commit response to conversation first
-    await updateConversation('ASSISTANT: ' + responseText);
+    // Add the commit response to conversation first (remove MESSAGE_END)
+    const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
+    await updateConversation('ASSISTANT:\n' + cleanResponse);
     
     await fs.writeFile(pendingData.filePath, pendingData.modifiedContent, 'utf8');
     await fs.unlink('pending-changes.json');
@@ -1122,7 +1163,7 @@ async function handlePendingUpdate(responseText) {
     
     await gitCommitAndPush(pendingData.file, pendingData.description);
     
-    await updateConversation('SYSTEM: Changes committed to ' + pendingData.file + ' and pushed to git');
+    await updateConversation('SYSTEM:\nChanges committed to ' + pendingData.file + ' and pushed to git');
     await fs.writeFile('ai-response.md', '', 'utf8');
     
     const buildPrompt = require('./message-to-prompt').buildPrompt;
@@ -1130,7 +1171,8 @@ async function handlePendingUpdate(responseText) {
     console.log('✓ Next prompt ready in generated-prompt.md');
     
   } else {
-    await updateConversation('ASSISTANT: ' + responseText);
+    const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
+    await updateConversation('ASSISTANT:\n' + cleanResponse);
     
     const fileOps = tools.filter(function(t) {
       return t.name === 'UPDATE_FILE' || t.name === 'INSERT_LINES';
@@ -1145,7 +1187,7 @@ async function handlePendingUpdate(responseText) {
         return;
       }
     } else {
-      await updateConversation('SYSTEM: Invalid response to pending update. Please use @COMMIT or provide corrected @UPDATE_FILE/@INSERT_LINES for ' + pendingData.file);
+      await updateConversation('SYSTEM:\nInvalid response to pending update. Please use @COMMIT or provide corrected @UPDATE_FILE/@INSERT_LINES for ' + pendingData.file);
       
       const buildPrompt = require('./message-to-prompt').buildPrompt;
       await buildPrompt();
@@ -1161,13 +1203,19 @@ async function updateConversation(newMessage) {
   const historyIndex = lines.findIndex(function(line) { return line.includes('=== CONVERSATION HISTORY ==='); });
   
   if (historyIndex === -1) {
-    const updated = '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n' + newMessage;
+    const updated = '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n\n' + newMessage;
     await fs.writeFile('conversation.md', updated, 'utf8');
   } else {
     const before = lines.slice(0, historyIndex + 1);
     const after = lines.slice(historyIndex + 1);
     
-    const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', ''].concat(before.slice(historyIndex)).concat([newMessage]).concat(after);
+    // Append to the end of the conversation (newest at bottom)
+    const existingHistory = after.join('\n');
+    const newHistory = existingHistory + (existingHistory.trim() ? '\n\n' : '') + newMessage;
+    
+    const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', '']
+      .concat(before.slice(historyIndex))
+      .concat([newHistory]);
     
     await fs.writeFile('conversation.md', updated.join('\n'), 'utf8');
   }
@@ -1241,7 +1289,14 @@ async function moveMessageToHistory(message) {
     const before = lines.slice(0, historyIndex + 1);
     const after = lines.slice(historyIndex + 1);
     
-    const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', ''].concat(before.slice(historyIndex)).concat(['USER: ' + message]).concat(after);
+    // Append to the end of the conversation (newest at bottom)
+    const existingHistory = after.join('\n');
+    const userMessage = 'USER:\n' + message;
+    const newHistory = existingHistory + (existingHistory.trim() ? '\n\n' : '') + userMessage;
+    
+    const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', '']
+      .concat(before.slice(historyIndex))
+      .concat([newHistory]);
     
     await require('fs').promises.writeFile('conversation.md', updated.join('\n'), 'utf8');
     console.log('✓ Moved user message to history');
