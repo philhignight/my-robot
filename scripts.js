@@ -1133,6 +1133,11 @@ async function executeReadFile(params) {
   try {
     const filePath = utils.getCodebasePath(params.file_name);
     const content = await fs.readFile(filePath, 'utf8');
+    
+    if (!content || content.trim() === '') {
+      return params.file_name + ' is empty';
+    }
+    
     const lines = content.split('\n');
     const numberedLines = [];
     for (let i = 0; i < lines.length; i++) {
