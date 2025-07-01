@@ -63,7 +63,28 @@ async function buildPrompt() {
     }
     prompt += '\n\nCONTEXT:\n' + fullContext;
     
-    // Only// utils.js
+    // Only include conversation if there's history
+    if (conversationHistory) {
+      prompt += '\n\nCONVERSATION HISTORY:\n' + conversationHistory;
+    }
+    
+    // Add instruction for AI to respond
+    prompt += '\n\nGenerate your response as the assistant.';
+    
+    await fs.writeFile('generated-prompt.md', prompt, 'utf8');
+    console.log('✓ Built prompt for ' + mode + ' mode');
+    
+    if (prompt.length > 500000) {
+      console.log('⚠ Warning: Prompt is ' + prompt.length + ' chars, approaching 600k limit');
+      if (prompt.length > 550000) {
+        console.log('⚠ Consider running "npm run reset" if prompt becomes too large');
+      }
+    }
+    
+  } catch (err) {
+    console.error('Error building prompt:', err);
+  }
+}// utils.js
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -148,7 +169,28 @@ function parseToolBlocks(text) {
       }
     }
     
-    content = cleanedLines.join('\n');
+    // Join continuation lines (lines starting with "... ")
+    const joinedLines = [];
+    let currentLine = '';
+    
+    for (let i = 0; i < cleanedLines.length; i++) {
+      const line = cleanedLines[i];
+      if (line.startsWith('... ')) {
+        // Continuation line - append to current line
+        currentLine += line.slice(4); // Remove "... " prefix
+      } else {
+        // New line - save previous and start new
+        if (currentLine) {
+          joinedLines.push(currentLine);
+        }
+        currentLine = line;
+      }
+    }
+    if (currentLine) {
+      joinedLines.push(currentLine);
+    }
+    
+    content = joinedLines.join('\n');
   }
   
   // Match tool patterns: [TOOLNAME] args on one line, then content until next tool or END tag
@@ -907,7 +949,79 @@ async function buildPrompt() {
   }
 }
 
-module.exports = { buildPrompt: buildPrompt };
+async function executeTwoLevelList(params) {
+  try {
+    const dirPath = utils.getCodebasePath(params.path || '.');
+    
+    async function buildTree(dir, prefix, depth, maxDepth) {
+      if (depth > maxDepth) return '';
+      
+      let result = '';
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      
+      // Separate and sort directories and files
+      const dirs = [];
+      const files = [];
+      
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.name.startsWith('.')) continue;
+        
+        if (entry.isDirectory()) {
+          dirs.push(entry.name);
+        } else {
+          files.push(entry.name);
+        }
+      }
+      
+      dirs.sort();
+      files.sort();
+      
+      // Process directories
+      for (let i = 0; i < dirs.length; i++) {
+        const dirName = dirs[i];
+        const isLast = (i === dirs.length - 1 && files.length === 0);
+        const subPath = path.join(dir, dirName);
+        
+        result += prefix + (isLast ? '└── ' : '├── ') + dirName + '/\n';
+        
+        // Recursively build subtree
+        if (depth < maxDepth) {
+          const subTree = await buildTree(subPath, prefix + (isLast ? '    ' : '│   '), depth + 1, maxDepth);
+          result += subTree;
+        }
+      }
+      
+      // Process files
+      for (let i = 0; i < files.length; i++) {
+        const fileName = files[i];
+        const isLast = (i === files.length - 1);
+        const filePath = path.join(dir, fileName);
+        const lineCount = await utils.getLineCount(filePath);
+        
+        result += prefix + (isLast ? '└── ' : '├── ') + fileName + ' (' + lineCount + ' lines)\n';
+      }
+      
+      return result;
+    }
+    
+    const rootName = params.path || '.';
+    let result = 'Contents of ' + rootName + ':\n';
+    
+    const tree = await buildTree(dirPath, '', 0, 2);
+    if (tree) {
+      result += tree;
+    } else {
+      result += '[Empty directory]';
+    }
+    
+    return result;
+  } catch (err) {
+    return 'Error listing directory: ' + err.message;
+  }
+}
+
+module.exports = { buildPrompt: buildPrompt, executeTwoLevelList: executeTwoLevelList };
 
 // ==========================================
 
