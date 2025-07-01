@@ -63,37 +63,181 @@ function parseBlocks(text) {
 
 function parseToolBlocks(text) {
   const tools = [];
-  const toolRegex = /@(\w+)\s*\{([^}]*)\}/gs;
-  let match;
   
-  while ((match = toolRegex.exec(text)) !== null) {
-    const toolName = match[1];
-    const blockContent = match[2];
-    const params = {};
+  // Remove the box wrapper if present
+  const boxMatch = text.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
+  const content = boxMatch ? boxMatch[1] : text;
+  
+  // Match tool patterns: [TOOLNAME] args on one line, then content until next tool or END tag
+  const lines = content.split('\n');
+  let i = 0;
+  
+  while (i < lines.length) {
+    const line = lines[i].trim();
     
-    // Parse key-value pairs
-    const paramRegex = /(\w+):\s*\[\[\[value\]\]\]\s*(.*?)\s*\[\[\[\/\]\]\]/gs;
-    let paramMatch;
-    
-    while ((paramMatch = paramRegex.exec(blockContent)) !== null) {
-      params[paramMatch[1]] = paramMatch[2].trim();
+    // Check for tool start pattern
+    const toolMatch = line.match(/^\[([A-Z_]+)\](?:\s+(.*))?$/);
+    if (toolMatch) {
+      const toolName = toolMatch[1];
+      const args = toolMatch[2] || '';
+      
+      // Find where this tool ends (next tool, END tag, or end of content)
+      let endIndex = lines.length;
+      let hasEndTag = false;
+      
+      for (let j = i + 1; j < lines.length; j++) {
+        const checkLine = lines[j].trim();
+        // Check for END tag
+        if (checkLine === '[END_' + toolName + ']') {
+          endIndex = j;
+          hasEndTag = true;
+          break;
+        }
+        // Check for next tool
+        if (checkLine.match(/^\[([A-Z_]+)\]/)) {
+          endIndex = j;
+          break;
+        }
+      }
+      
+      // Extract content lines
+      const contentLines = lines.slice(i + 1, endIndex);
+      const content = contentLines.join('\n').trim();
+      
+      // Parse based on tool type
+      const params = parseToolParams(toolName, args, content);
+      
+      tools.push({
+        name: toolName,
+        params: params,
+        startIndex: 0, // We'll update this if needed
+        endIndex: 0
+      });
+      
+      // Move past this tool (and END tag if present)
+      i = hasEndTag ? endIndex + 1 : endIndex;
+    } else {
+      i++;
     }
-    
-    tools.push({ 
-      name: toolName, 
-      params: params,
-      startIndex: match.index,
-      endIndex: match.index + match[0].length
-    });
   }
   
   return tools;
 }
 
+function parseToolParams(toolName, args, content) {
+  const params = {};
+  
+  switch (toolName) {
+    case 'LIST':
+      params.path = args || '.';
+      params.explanation = content;
+      break;
+      
+    case 'READ':
+      params.file_name = args;
+      params.explanation = content;
+      break;
+      
+    case 'SEARCH_NAME':
+      const nameArgs = args.split(/\s+/);
+      params.regex = nameArgs[0];
+      params.folder = nameArgs[1] || '.';
+      params.explanation = content;
+      break;
+      
+    case 'SEARCH_CONTENT':
+      const contentArgs = args.split(/\s+/);
+      params.regex = contentArgs[0];
+      params.folder = contentArgs[1] || '.';
+      params.explanation = content;
+      break;
+      
+    case 'MESSAGE':
+      // For MESSAGE, all content is the message
+      params.content = content;
+      break;
+      
+    case 'CREATE':
+      params.path = args;
+      // Check if first line is a description comment
+      const createLines = content.split('\n');
+      if (createLines[0] && createLines[0].startsWith('# ')) {
+        params.description = createLines[0].slice(2);
+        params.contents = createLines.slice(1).join('\n');
+      } else {
+        params.contents = content;
+      }
+      break;
+      
+    case 'UPDATE':
+      const updateArgs = args.split(/\s+/);
+      params.file_name = updateArgs[0];
+      params.start_line = updateArgs[1];
+      params.end_line = updateArgs[2];
+      // First line should be # description
+      const updateLines = content.split('\n');
+      if (updateLines[0] && updateLines[0].startsWith('# ')) {
+        params.change_description = updateLines[0].slice(2);
+        params.contents = updateLines.slice(1).join('\n');
+      } else {
+        // Fallback if no # description
+        params.change_description = 'File update';
+        params.contents = content;
+      }
+      break;
+      
+    case 'INSERT':
+      const insertArgs = args.split(/\s+/);
+      params.file_name = insertArgs[0];
+      params.line_number = insertArgs[1];
+      // First line should be # description
+      const insertLines = content.split('\n');
+      if (insertLines[0] && insertLines[0].startsWith('# ')) {
+        params.change_description = insertLines[0].slice(2);
+        params.contents = insertLines.slice(1).join('\n');
+      } else {
+        // Fallback if no # description
+        params.change_description = 'Line insertion';
+        params.contents = content;
+      }
+      break;
+      
+    case 'DELETE':
+      params.file_name = args;
+      params.explanation = content;
+      break;
+      
+    case 'DISCOVERED':
+      params.importance = parseInt(args) || 5;
+      params.content = content;
+      break;
+      
+    case 'SWITCH_TO':
+      params.mode = args;
+      break;
+      
+    case 'EXPLORATION_FINDINGS':
+      params.name = args;
+      params.content = content;
+      break;
+      
+    case 'DETAILED_PLAN':
+      params.name = args;
+      params.content = content;
+      break;
+      
+    case 'COMMIT':
+      // No params needed
+      break;
+  }
+  
+  return params;
+}
+
 function classifyTools(tools) {
-  const informationTools = ['READ_FILE', 'SEARCH_FILES_BY_NAME', 'SEARCH_FILES_BY_CONTENT', 'LIST_DIRECTORY'];
-  const responseTools = ['RESPONSE_MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
-                        'CREATE_NEW_FILE', 'UPDATE_FILE', 'INSERT_LINES', 'DELETE_FILE',
+  const informationTools = ['LIST', 'READ', 'SEARCH_NAME', 'SEARCH_CONTENT'];
+  const responseTools = ['MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
+                        'CREATE', 'UPDATE', 'INSERT', 'DELETE',
                         'SWITCH_TO', 'COMMIT'];
   
   const hasInfoTools = tools.some(t => informationTools.includes(t.name));
@@ -114,19 +258,12 @@ function classifyTools(tools) {
 function validateResponseType(text, tools) {
   const classification = classifyTools(tools);
   
-  // Remove tool blocks and message end marker
-  const responseContent = text
-    .replace(/@\w+\s*\{[^}]*\}/gs, '')
-    .replace(/\[\[\[MESSAGE_END\]\]\]/g, '')
-    .trim();
-  
-  // Check for ANY content outside of tools (should be none)
-  const hasContent = responseContent.length > 0;
-  
-  if (hasContent) {
+  // Check if message has the required box format
+  const hasBox = text.includes('┌─ ASSISTANT') && text.includes('└─');
+  if (!hasBox) {
     return {
       valid: false,
-      error: 'No plain text allowed. All content must be inside tool blocks. Use @RESPONSE_MESSAGE for text.'
+      error: 'Response must be wrapped in ASCII box starting with ┌─ ASSISTANT ─┐'
     };
   }
   
@@ -152,85 +289,30 @@ function validateResponseType(text, tools) {
 }
 
 function replaceToolsWithIndicators(text, tools) {
-  let result = text;
+  // For assistant messages, we want to preserve the box format but ensure proper wrapping
+  let cleanText = text.trim();
   
-  // Remove MESSAGE_END marker first
-  result = result.replace(/\[\[\[MESSAGE_END\]\]\]/g, '').trim();
-  
-  // Sort tools by start index in reverse order so we can replace from end to beginning
-  const sortedTools = tools.slice().sort(function(a, b) { return b.startIndex - a.startIndex; });
-  
-  for (let i = 0; i < sortedTools.length; i++) {
-    const tool = sortedTools[i];
-    let indicator = '';
-    let explanation = '';
-    
-    switch (tool.name) {
-      case 'RESPONSE_MESSAGE':
-        // For response messages, include the full content
-        indicator = tool.params.content || '[Empty message]';
-        break;
-      case 'LIST_DIRECTORY':
-        explanation = tool.params.explanation || 'Listing directory';
-        indicator = explanation + '\n[LIST] ' + (tool.params.path || '.');
-        break;
-      case 'READ_FILE':
-        explanation = tool.params.explanation || 'Reading file';
-        indicator = explanation + '\n[READ] ' + tool.params.file_name;
-        break;
-      case 'SEARCH_FILES_BY_NAME':
-        explanation = tool.params.explanation || 'Searching files by name';
-        indicator = explanation + '\n[SEARCH_NAME] ' + tool.params.regex + ' in ' + tool.params.folder;
-        break;
-      case 'SEARCH_FILES_BY_CONTENT':
-        explanation = tool.params.explanation || 'Searching files by content';
-        indicator = explanation + '\n[SEARCH_CONTENT] ' + tool.params.regex + ' in ' + tool.params.folder;
-        break;
-      case 'CREATE_NEW_FILE':
-        indicator = 'Creating new file\n[CREATE] ' + tool.params.path;
-        break;
-      case 'UPDATE_FILE':
-        indicator = tool.params.change_description + '\n[UPDATE] ' + tool.params.file_name + ' (lines ' + tool.params.start_line + '-' + tool.params.end_line + ')';
-        break;
-      case 'INSERT_LINES':
-        indicator = tool.params.change_description + '\n[INSERT] ' + tool.params.file_name + ' at line ' + tool.params.line_number;
-        break;
-      case 'DELETE_FILE':
-        indicator = 'Deleting file\n[DELETE] ' + tool.params.file_name;
-        break;
-      case 'DISCOVERED':
-        indicator = 'Discovery (importance ' + tool.params.importance + '):\n' + tool.params.content;
-        break;
-      case 'SWITCH_TO':
-        indicator = 'Switching to ' + tool.params.mode + ' mode';
-        break;
-      case 'EXPLORATION_FINDINGS':
-        indicator = 'Saving exploration findings: ' + (tool.params.name || 'findings');
-        break;
-      case 'DETAILED_PLAN':
-        indicator = 'Saving implementation plan: ' + (tool.params.name || 'plan');
-        break;
-      case 'COMMIT':
-        indicator = 'Committing changes';
-        break;
-      default:
-        indicator = tool.name + ' tool used';
-    }
-    
-    result = result.slice(0, tool.startIndex) + indicator + result.slice(tool.endIndex);
+  // If the text already has the box format, extract and re-wrap the content
+  const boxMatch = cleanText.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
+  if (boxMatch) {
+    const content = boxMatch[1];
+    // Re-wrap the content to ensure consistent width
+    return formatInBox(content, 70);
   }
   
-  return result;
+  // If no box format found, just return the cleaned text
+  return cleanText;
 }
 
-function hasMessageEnd(text) {
-  return text.includes('[[[MESSAGE_END]]]');
+function hasBoxClosure(text) {
+  return /└─+┘/.test(text);
 }
 
 function validateMessageFormat(text) {
-  if (!hasMessageEnd(text)) {
-    throw new Error('Invalid format: Missing [[[MESSAGE_END]]]');
+  if (!text.includes('┌─ ASSISTANT') || !hasBoxClosure(text)) {
+    throw new Error('Invalid format: Response must be wrapped in complete ASCII box');
   }
+  
   return true;
 }
 
@@ -390,22 +472,32 @@ function compactConversation(conversationHistory, maxLength) {
   
   const lines = conversationHistory.split('\n').filter(function(line) { return line.trim(); });
   
-  // Find conversation exchanges (USER: and ASSISTANT: pairs)
+  // Find conversation exchanges (> for user, ┌─ ASSISTANT for assistant)
   const exchanges = [];
   let currentExchange = { user: '', assistant: '', other: [] };
+  let inAssistantBox = false;
+  let assistantLines = [];
   
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     
-    if (line.startsWith('USER: ')) {
+    if (line.startsWith('> ')) {
       // Start new exchange
       if (currentExchange.user || currentExchange.assistant.length > 0) {
         exchanges.push(currentExchange);
       }
       currentExchange = { user: line, assistant: '', other: [] };
-    } else if (line.startsWith('ASSISTANT: ')) {
-      currentExchange.assistant = line;
-    } else if (line.startsWith('TOOL RESULT') || line.startsWith('SYSTEM:') || line.startsWith('-->')) {
+    } else if (line.includes('┌─ ASSISTANT')) {
+      inAssistantBox = true;
+      assistantLines = [line];
+    } else if (inAssistantBox) {
+      assistantLines.push(line);
+      if (line.includes('└─')) {
+        inAssistantBox = false;
+        currentExchange.assistant = assistantLines.join('\n');
+        assistantLines = [];
+      }
+    } else if (line.startsWith('SYSTEM:')) {
       currentExchange.other.push(line);
     }
   }
@@ -435,11 +527,22 @@ function compactConversation(conversationHistory, maxLength) {
     
     // Extract important information
     if (userText.includes('implement') || userText.includes('create') || userText.includes('build')) {
-      decisions.push('User requested: ' + userText.replace('USER: ', ''));
+      decisions.push('User requested: ' + userText.replace('> ', ''));
     }
     
-    if (assistantText.includes('--> Switch to') || assistantText.includes('mode')) {
-      decisions.push('Mode change: ' + assistantText.replace('ASSISTANT: ', '').split('\n')[0]);
+    if (assistantText.includes('[SWITCH_TO]')) {
+      const modeMatch = assistantText.match(/\[SWITCH_TO\]\s+(\w+)/);
+      if (modeMatch) {
+        decisions.push('Mode change to ' + modeMatch[1]);
+      }
+    }
+    
+    // Look for discoveries in assistant text
+    if (assistantText.includes('[DISCOVERED]')) {
+      const discoveryMatch = assistantText.match(/\[DISCOVERED\]\s+(\d+)\s+([^\n]+)/);
+      if (discoveryMatch) {
+        discoveries.push('Discovery (importance ' + discoveryMatch[1] + '): ' + discoveryMatch[2]);
+      }
     }
     
     // Look for key decisions in tool results
@@ -532,6 +635,72 @@ function getCodebasePath(relativePath) {
   return path.join(CODEBASE_PATH, relativePath);
 }
 
+function wrapText(text, maxWidth) {
+  if (!maxWidth) maxWidth = 70;
+  const words = text.split(' ');
+  const lines = [];
+  let currentLine = '';
+  
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (currentLine.length + word.length + 1 > maxWidth) {
+      lines.push(currentLine);
+      currentLine = '... ' + word;
+    } else {
+      currentLine += (currentLine ? ' ' : '') + word;
+    }
+  }
+  
+  if (currentLine) lines.push(currentLine);
+  return lines;
+}
+
+function formatInBox(content, width) {
+  if (!width) width = 70;
+  const lines = content.split('\n');
+  const wrappedLines = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.length <= width - 4) { // Account for box borders
+      wrappedLines.push(line);
+    } else {
+      // Wrap long lines
+      const wrapped = wrapText(line, width - 4);
+      wrappedLines.push(...wrapped);
+    }
+  }
+  
+  // Build box
+  let result = '┌─ ASSISTANT ';
+  result += '─'.repeat(width - result.length - 1) + '┐\n';
+  
+  for (let i = 0; i < wrappedLines.length; i++) {
+    const line = wrappedLines[i];
+    result += '│ ' + line + ' '.repeat(width - line.length - 4) + ' │\n';
+  }
+  
+  result += '└' + '─'.repeat(width - 2) + '┘';
+  return result;
+}
+
+function wrapSystemMessage(content) {
+  const lines = content.split('\n');
+  const wrapped = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.length <= 70) {
+      wrapped.push(line);
+    } else {
+      const wrappedLine = wrapText(line, 70);
+      wrapped.push(...wrappedLine);
+    }
+  }
+  
+  return wrapped.join('\n');
+}
+
 module.exports = {
   CODEBASE_PATH: CODEBASE_PATH,
   ensureDir: ensureDir,
@@ -543,7 +712,7 @@ module.exports = {
   validateResponseType: validateResponseType,
   replaceToolsWithIndicators: replaceToolsWithIndicators,
   validateMessageFormat: validateMessageFormat,
-  hasMessageEnd: hasMessageEnd,
+  hasBoxClosure: hasBoxClosure,
   searchFilesByName: searchFilesByName,
   searchFilesByContent: searchFilesByContent,
   calculateImportanceWeight: calculateImportanceWeight,
@@ -552,7 +721,10 @@ module.exports = {
   calculatePromptLength: calculatePromptLength,
   getLineCount: getLineCount,
   countFilesInDir: countFilesInDir,
-  getCodebasePath: getCodebasePath
+  getCodebasePath: getCodebasePath,
+  wrapText: wrapText,
+  formatInBox: formatInBox,
+  wrapSystemMessage: wrapSystemMessage
 };
 
 // ==========================================
@@ -603,7 +775,7 @@ async function buildPrompt() {
     }
     
     // Add instruction for AI to respond
-    prompt += '\n\nGenerate your response as the assistant. Remember to end with [[[MESSAGE_END]]].';
+    prompt += '\n\nGenerate your response as the assistant.';
     
     await fs.writeFile('generated-prompt.md', prompt, 'utf8');
     console.log('✓ Built prompt for ' + mode + ' mode');
@@ -644,7 +816,7 @@ async function processResponse() {
     try {
       utils.validateMessageFormat(responseText);
     } catch (formatError) {
-      if (formatError.message.includes('Missing [[[MESSAGE_END]]]')) {
+      if (formatError.message.includes('complete ASCII box')) {
         console.log('⚠ Incomplete message detected, requesting continuation');
         await handleIncompleteMessage(responseText);
         return;
@@ -682,12 +854,12 @@ async function processResponse() {
 async function handleResponseTypeError(errorMessage, responseText) {
   // Don't add the invalid response to conversation
   
-  const errorResponse = 'SYSTEM ERROR:\n' + errorMessage + '\n\n' +
+  const errorResponse = 'SYSTEM: ERROR - ' + errorMessage + '\n\n' +
     'Response Rules:\n' +
-    '1. READ Response: Use ONLY read/search/list tools, NO other content\n' +
-    '2. WRITE Response: Use @RESPONSE_MESSAGE for text and/or action tools\n' +
-    '3. NO plain text allowed outside of tools\n\n' +
-    'Your last response violated these rules. Please try again with the correct response type.';
+    '1. READ Response: Use ONLY [LIST], [READ], [SEARCH_NAME], [SEARCH_CONTENT]\n' +
+    '2. WRITE Response: Use [MESSAGE] for text and/or action tools\n' +
+    '3. Wrap response in ┌─ ASSISTANT ─┐ box\n\n' +
+    'Your last response violated these rules. Please try again.';
   
   await updateConversation(errorResponse);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -699,9 +871,9 @@ async function handleResponseTypeError(errorMessage, responseText) {
 }
 
 async function handleReadResponse(responseText, tools) {
-  // For read responses, just add the indicators to conversation
+  // For read responses, just add the box format to conversation
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-  await updateConversation('ASSISTANT:\n' + cleanResponse);
+  await updateConversation(cleanResponse);
   
   // Process all read tools
   for (let i = 0; i < tools.length; i++) {
@@ -710,7 +882,7 @@ async function handleReadResponse(responseText, tools) {
     
     // Add tool result to conversation
     const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-    await updateConversation('TOOL RESULT (' + tool.name + '):\n' + resultText);
+    await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + resultText);
   }
   
   // Clear response and build next prompt
@@ -724,11 +896,11 @@ async function handleReadResponse(responseText, tools) {
 async function handleWriteResponse(responseText, tools) {
   // Replace tool calls with readable indicators in conversation
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-  await updateConversation('ASSISTANT:\n' + cleanResponse);
+  await updateConversation(cleanResponse);
   
   // Separate tool types
   const messageTools = tools.filter(function(t) {
-    return t.name === 'RESPONSE_MESSAGE';
+    return t.name === 'MESSAGE';
   });
   
   const specialTools = tools.filter(function(t) {
@@ -737,11 +909,11 @@ async function handleWriteResponse(responseText, tools) {
   });
   
   const fileTools = tools.filter(function(t) {
-    return t.name === 'CREATE_NEW_FILE' || t.name === 'UPDATE_FILE' || 
-           t.name === 'INSERT_LINES' || t.name === 'DELETE_FILE';
+    return t.name === 'CREATE' || t.name === 'UPDATE' || 
+           t.name === 'INSERT' || t.name === 'DELETE';
   });
   
-  // Handle RESPONSE_MESSAGE tools - no execution needed, already in conversation
+  // Handle MESSAGE tools - no execution needed, already in conversation
   // The content is already shown via replaceToolsWithIndicators
   
   // Handle special tools
@@ -755,14 +927,14 @@ async function handleWriteResponse(responseText, tools) {
     const tool = fileTools[i];
     const result = await executeTool(tool);
     
-    if (tool.name === 'UPDATE_FILE' || tool.name === 'INSERT_LINES') {
+    if (tool.name === 'UPDATE' || tool.name === 'INSERT') {
       await requestFileConfirmation(tool, result);
       return; // Wait for confirmation
     }
     
     // Add tool result to conversation
     const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-    await updateConversation('TOOL RESULT (' + tool.name + '):\n' + resultText);
+    await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + resultText);
   }
   
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -780,9 +952,9 @@ async function handleFormatError(errorMessage) {
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   
   // Add the malformed response to conversation so AI can see what went wrong
-  await updateConversation('ASSISTANT:\n' + cleanResponse);
+  await updateConversation(cleanResponse);
   
-  const errorResponse = 'SYSTEM ERROR:\n' + errorMessage + '\n\nPlease fix your response format. Remember to end with [[[MESSAGE_END]]].';
+  const errorResponse = 'SYSTEM: ERROR - ' + errorMessage + '\n\nPlease fix your response format. Remember to wrap in ┌─ ASSISTANT ─┐ box.';
   
   await updateConversation(errorResponse);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -799,11 +971,11 @@ async function handleIncompleteMessage(responseText) {
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   
   // Add the incomplete response to conversation
-  await updateConversation('ASSISTANT:\n' + cleanResponse);
+  await updateConversation(cleanResponse);
   
   // Get the last 100 characters to show context
   const lastPart = responseText.slice(-100);
-  const continuationRequest = 'SYSTEM:\nYour message was cut off. Please continue from where you left off: "' + lastPart + '"\n\nRemember to end with [[[MESSAGE_END]]].';
+  const continuationRequest = 'SYSTEM: Your message was cut off. Please continue from: "' + lastPart + '"';
   
   await updateConversation(continuationRequest);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -882,21 +1054,21 @@ async function updateMode(newMode) {
 
 async function executeTool(tool) {
   switch (tool.name) {
-    case 'LIST_DIRECTORY':
+    case 'LIST':
       return await executeListDirectory(tool.params);
-    case 'READ_FILE':
+    case 'READ':
       return await executeReadFile(tool.params);
-    case 'SEARCH_FILES_BY_NAME':
+    case 'SEARCH_NAME':
       return await executeSearchFilesByName(tool.params);
-    case 'SEARCH_FILES_BY_CONTENT':
+    case 'SEARCH_CONTENT':
       return await executeSearchFilesByContent(tool.params);
-    case 'CREATE_NEW_FILE':
+    case 'CREATE':
       return await executeCreateFile(tool.params);
-    case 'UPDATE_FILE':
+    case 'UPDATE':
       return await executeUpdateFile(tool.params);
-    case 'INSERT_LINES':
+    case 'INSERT':
       return await executeInsertLines(tool.params);
-    case 'DELETE_FILE':
+    case 'DELETE':
       return await executeDeleteFile(tool.params);
     default:
       return 'Unknown tool: ' + tool.name;
@@ -1007,7 +1179,7 @@ async function executeCreateFile(params) {
   try {
     const filePath = utils.getCodebasePath(params.path);
     await utils.ensureDir(path.dirname(filePath));
-    await fs.writeFile(filePath, params.contents, 'utf8');
+    await fs.writeFile(filePath, params.contents || '', 'utf8');
     
     return '✓ Created ' + params.path;
   } catch (err) {
@@ -1085,7 +1257,7 @@ async function executeDeleteFile(params) {
 
 async function requestFileConfirmation(tool, result) {
   if (typeof result === 'string') {
-    await updateConversation('TOOL RESULT (' + tool.name + '):\n' + result);
+    await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + result);
     return;
   }
   
@@ -1119,7 +1291,7 @@ async function requestFileConfirmation(tool, result) {
     modifiedPreview.push((previewStart + i + 1) + ': ' + modifiedSlice[i]);
   }
   
-  const confirmation = 'PENDING UPDATE for ' + tool.params.file_name + '\nDESCRIPTION: ' + description + '\n\nORIGINAL CODE (lines ' + (previewStart + 1) + '-' + (changeStart + 1) + '):\n' + originalPreview.join('\n') + '\n\nNEW CODE (lines ' + (previewStart + 1) + '-' + (previewEnd + 1) + '):\n' + modifiedPreview.join('\n') + '\n\nReply with @COMMIT to apply, or send new @UPDATE_FILE/@INSERT_LINES for this file.';
+  const confirmation = 'SYSTEM: PENDING UPDATE for ' + tool.params.file_name + '\nDESCRIPTION: ' + description + '\n\nORIGINAL CODE (lines ' + (previewStart + 1) + '-' + (changeStart + 1) + '):\n' + originalPreview.join('\n') + '\n\nNEW CODE (lines ' + (previewStart + 1) + '-' + (previewEnd + 1) + '):\n' + modifiedPreview.join('\n') + '\n\nReply with [COMMIT] to apply changes.';
   
   const pendingData = {
     file: tool.params.file_name,
@@ -1132,7 +1304,7 @@ async function requestFileConfirmation(tool, result) {
   
   await fs.writeFile('pending-changes.json', JSON.stringify(pendingData, null, 2), 'utf8');
   
-  await updateConversation('SYSTEM:\n' + confirmation);
+  await updateConversation(confirmation);
   await fs.writeFile('ai-response.md', '', 'utf8');
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
@@ -1145,7 +1317,7 @@ async function requestFileConfirmation(tool, result) {
 
 async function handlePendingUpdate(responseText) {
   // Check if message is complete
-  if (!utils.hasMessageEnd(responseText)) {
+  if (!utils.hasBoxClosure(responseText)) {
     console.log('⚠ Incomplete message during pending update, requesting continuation');
     await handleIncompleteMessage(responseText);
     return;
@@ -1153,14 +1325,14 @@ async function handlePendingUpdate(responseText) {
   
   const pendingData = JSON.parse(await fs.readFile('pending-changes.json', 'utf8'));
   
-  // Check for @COMMIT tool in the new format
+  // Check for COMMIT tool in the new format
   const tools = utils.parseToolBlocks(responseText);
   const commitTool = tools.find(function(t) { return t.name === 'COMMIT'; });
   
   if (commitTool || responseText.includes('COMMIT')) {
-    // Add the commit response to conversation first (remove MESSAGE_END)
+    // Add the commit response to conversation first
     const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-    await updateConversation('ASSISTANT:\n' + cleanResponse);
+    await updateConversation(cleanResponse);
     
     await fs.writeFile(pendingData.filePath, pendingData.modifiedContent, 'utf8');
     await fs.unlink('pending-changes.json');
@@ -1169,7 +1341,7 @@ async function handlePendingUpdate(responseText) {
     
     await gitCommitAndPush(pendingData.file, pendingData.description);
     
-    await updateConversation('SYSTEM:\nChanges committed to ' + pendingData.file + ' and pushed to git');
+    await updateConversation('SYSTEM: Changes committed to ' + pendingData.file + ' and pushed to git');
     await fs.writeFile('ai-response.md', '', 'utf8');
     
     const buildPrompt = require('./message-to-prompt').buildPrompt;
@@ -1179,10 +1351,10 @@ async function handlePendingUpdate(responseText) {
     
   } else {
     const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-    await updateConversation('ASSISTANT:\n' + cleanResponse);
+    await updateConversation(cleanResponse);
     
     const fileOps = tools.filter(function(t) {
-      return t.name === 'UPDATE_FILE' || t.name === 'INSERT_LINES';
+      return t.name === 'UPDATE' || t.name === 'INSERT';
     });
     
     if (fileOps.length > 0 && fileOps[0].params.file_name === pendingData.file) {
@@ -1194,7 +1366,7 @@ async function handlePendingUpdate(responseText) {
         return;
       }
     } else {
-      await updateConversation('SYSTEM:\nInvalid response to pending update. Please use @COMMIT or provide corrected @UPDATE_FILE/@INSERT_LINES for ' + pendingData.file);
+      await updateConversation('SYSTEM: Invalid response. Please use [COMMIT] to apply changes.');
       
       const buildPrompt = require('./message-to-prompt').buildPrompt;
       await buildPrompt();
@@ -1221,11 +1393,26 @@ async function updateConversationForPrompt() {
 async function updateConversation(newMessage) {
   const conversation = await utils.readFileIfExists('conversation.md');
   
+  // Apply wrapping based on message type
+  let wrappedMessage = newMessage;
+  if (newMessage.startsWith('SYSTEM:')) {
+    // Wrap system messages
+    const content = newMessage.slice('SYSTEM:'.length).trim();
+    const wrapped = utils.wrapSystemMessage(content);
+    wrappedMessage = 'SYSTEM: ' + wrapped.split('\n').join('\n        '); // Indent continuation lines
+  } else if (newMessage.startsWith('> ')) {
+    // Wrap user messages
+    const content = newMessage.slice(2);
+    const wrapped = utils.wrapText(content, 70);
+    wrappedMessage = '> ' + wrapped.join('\n  '); // Indent continuation lines
+  }
+  // Assistant messages are already in box format from replaceToolsWithIndicators
+  
   const lines = conversation.split('\n');
   const historyIndex = lines.findIndex(function(line) { return line.includes('=== CONVERSATION HISTORY ==='); });
   
   if (historyIndex === -1) {
-    const updated = '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n\n' + newMessage;
+    const updated = '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n\n' + wrappedMessage;
     await fs.writeFile('conversation.md', updated, 'utf8');
   } else {
     const before = lines.slice(0, historyIndex + 1);
@@ -1233,7 +1420,7 @@ async function updateConversation(newMessage) {
     
     // Append to the end of the conversation (newest at bottom)
     const existingHistory = after.join('\n');
-    const newHistory = existingHistory + (existingHistory.trim() ? '\n\n' : '') + newMessage;
+    const newHistory = existingHistory + (existingHistory.trim() ? '\n\n' : '') + wrappedMessage;
     
     const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', '']
       .concat(before.slice(historyIndex))
@@ -1313,7 +1500,7 @@ async function moveMessageToHistory(message) {
     
     // Append to the end of the conversation (newest at bottom)
     const existingHistory = after.join('\n');
-    const userMessage = 'USER:\n' + message;
+    const userMessage = '> ' + message;
     const newHistory = existingHistory + (existingHistory.trim() ? '\n\n' : '') + userMessage;
     
     const updated = ['=== WAITING FOR YOUR MESSAGE ===', '[write here when ready]', '']
@@ -1333,9 +1520,9 @@ async function createInitialFiles() {
     'ai-response.md': '',
     'generated-prompt.md': '',
     'prompts/base.md': '# Base prompt template - Update this file with the full prompt from the documentation',
-    'prompts/exploration.md': '# EXPLORATION MODE\n\nYour job is to understand the codebase and requirements:\n\n- Use LIST_DIRECTORY to explore project structure\n- Use READ_FILE to examine key files\n- Use SEARCH_FILES_BY_NAME and SEARCH_FILES_BY_CONTENT to discover patterns\n- Use @RESPONSE_MESSAGE to ask clarifying questions or provide updates\n- Document findings with DISCOVERED blocks (importance 1-10)\n- When you have sufficient understanding, create exploration findings\n\nRemember: NO plain text allowed outside of tools. Use @RESPONSE_MESSAGE for all communication.\n\nFocus on understanding, not solving yet. Be thorough in your exploration.',
-    'prompts/planning.md': '# PLANNING MODE\n\nYour job is to create a detailed implementation plan:\n\n- Review the exploration findings to understand the current state\n- Use @RESPONSE_MESSAGE to ask final clarifying questions\n- Break down work into specific, concrete tasks with file changes\n- Create detailed-plan using @DETAILED_PLAN tool\n- Each task should specify exactly which files to modify and how\n- Use @RESPONSE_MESSAGE to explain your plan\n- Recommend "SWITCH_TO: implementation" when plan is complete\n\nRemember: NO plain text allowed. Use @RESPONSE_MESSAGE for all explanations.\n\nBe thorough - implementation should have no surprises.',
-    'prompts/implementation.md': '# IMPLEMENTATION MODE\n\nYour job is to execute the implementation plan:\n\n- Follow the detailed plan exactly as specified\n- Use UPDATE_FILE, INSERT_LINES, CREATE_NEW_FILE tools to make changes\n- Include descriptive change_description for all file operations\n- Use @RESPONSE_MESSAGE to explain what you\'re doing\n- Work through plan items systematically\n- If you hit unexpected issues: "SWITCH_TO: exploration"\n- Focus on execution, not replanning\n\nRemember: NO plain text allowed. Use @RESPONSE_MESSAGE for all communication.'
+    'prompts/exploration.md': '# EXPLORATION MODE\n\nYour job is to understand the codebase and requirements:\n\n- Use LIST to explore project structure\n- Use READ to examine key files\n- Use SEARCH_NAME and SEARCH_CONTENT to discover patterns\n- Use MESSAGE to ask clarifying questions or provide updates\n- Document findings with DISCOVERED blocks (importance 1-10)\n- When you have sufficient understanding, create exploration findings\n\nRemember: NO plain text allowed outside of tools. Use [MESSAGE] for all communication.\n\nFocus on understanding, not solving yet. Be thorough in your exploration.',
+    'prompts/planning.md': '# PLANNING MODE\n\nYour job is to create a detailed implementation plan:\n\n- Review the exploration findings to understand the current state\n- Use [MESSAGE] to ask final clarifying questions\n- Break down work into specific, concrete tasks with file changes\n- Create detailed-plan using [DETAILED_PLAN] tool\n- Each task should specify exactly which files to modify and how\n- Use [MESSAGE] to explain your plan\n- Recommend [SWITCH_TO] implementation when plan is complete\n\nRemember: NO plain text allowed. Use [MESSAGE] for all explanations.\n\nBe thorough - implementation should have no surprises.',
+    'prompts/implementation.md': '# IMPLEMENTATION MODE\n\nYour job is to execute the implementation plan:\n\n- Follow the detailed plan exactly as specified\n- Use UPDATE, INSERT, CREATE tools to make changes\n- Include descriptive change_description for all file operations\n- Use [MESSAGE] to explain what you\'re doing\n- Work through plan items systematically\n- If you hit unexpected issues: [SWITCH_TO] exploration\n- Focus on execution, not replanning\n\nRemember: NO plain text allowed. Use [MESSAGE] for all communication.'
   };
 
   const filenames = Object.keys(initialFiles);
