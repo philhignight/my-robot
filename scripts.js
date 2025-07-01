@@ -278,7 +278,22 @@ function compactDiscoveries(discoveries, maxCount) {
 }
 
 async function generateFileStructure() {
-  const structure = await buildDirectoryTree(CODEBASE_PATH, 0);
+  let structure = await buildDirectoryTree(CODEBASE_PATH, 0);
+  
+  // Add AI working documents
+  const aiDocsPath = path.join(__dirname, 'ai-docs');
+  try {
+    const aiDocsExists = await fs.access(aiDocsPath).then(() => true).catch(() => false);
+    if (aiDocsExists) {
+      structure += '\nAI WORKING DOCUMENTS:\n';
+      const aiDocs = await buildDirectoryTree(aiDocsPath, 0);
+      structure += aiDocs;
+      structure += '\n(This is your working area for saving exploration findings, implementation plans, and other documentation)\n';
+    }
+  } catch (err) {
+    // AI docs folder doesn't exist yet, that's fine
+  }
+  
   fileStructure = structure;
   return structure;
 }
@@ -345,8 +360,8 @@ module.exports = {
   readFileIfExists: readFileIfExists,
   getActiveSelection: getActiveSelection,
   getActiveMode: getActiveMode,
-  parseBlocks: parseBlocks,
   parseToolBlocks: parseToolBlocks,
+  replaceToolsWithIndicators: replaceToolsWithIndicators,
   validateMessageFormat: validateMessageFormat,
   hasMessageEnd: hasMessageEnd,
   searchFilesByName: searchFilesByName,
@@ -391,21 +406,8 @@ async function buildPrompt() {
       conversationHistory = lines.slice(historyIndex + 1).join('\n').trim();
     }
     
-    let phaseResults = '';
-    if (mode === 'planning') {
-      const findings = await utils.readFileIfExists('ai-managed/exploration-findings.md');
-      if (findings.trim()) {
-        phaseResults = '\n\nEXPLORATION FINDINGS:\n' + findings;
-      }
-    } else if (mode === 'implementation') {
-      const plan = await utils.readFileIfExists('ai-managed/detailed-plan.md');
-      if (plan.trim()) {
-        phaseResults = '\n\nIMPLEMENTATION PLAN:\n' + plan;
-      }
-    }
-    
     // Build prompt with conditional sections
-    let prompt = basePrompt + '\n\n' + modePrompt + '\n\nGOALS:\n' + goals + '\n\nPROJECT STRUCTURE:\n' + fileStructure + phaseResults;
+    let prompt = basePrompt + '\n\n' + modePrompt + '\n\nGOALS:\n' + goals + '\n\nPROJECT STRUCTURE:\n' + fileStructure;
     
     // Only include context if it has content
     if (context.trim()) {
@@ -452,7 +454,7 @@ async function processResponse() {
       return;
     }
     
-    // Validate message format first
+    // Validate basic format (just needs [[[MESSAGE_END]]])
     try {
       utils.validateMessageFormat(responseText);
     } catch (formatError) {
@@ -461,14 +463,14 @@ async function processResponse() {
       return;
     }
     
-    if (!utils.hasMessageEnd(responseText)) {
-      await handleIncompleteMessage(responseText);
-      return;
-    }
-    
+    // Parse tools from anywhere in the message
     const tools = utils.parseToolBlocks(responseText);
     
-    // Separate special tools from file operation tools
+    // Replace tool calls with readable indicators in conversation
+    const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
+    await updateConversation('ASSISTANT: ' + cleanResponse);
+    
+    // Separate tool types
     const specialTools = tools.filter(function(t) {
       return t.name === 'DISCOVERED' || t.name === 'SWITCH_TO' || 
              t.name === 'EXPLORATION_FINDINGS' || t.name === 'DETAILED_PLAN';
@@ -487,13 +489,19 @@ async function processResponse() {
     }
     
     // Handle file operation tools
-    if (fileTools.length > 0) {
-      await handleTools(fileTools);
-      return;
+    for (let i = 0; i < fileTools.length; i++) {
+      const tool = fileTools[i];
+      const result = await executeTool(tool);
+      
+      if (tool.name === 'UPDATE_FILE' || tool.name === 'INSERT_LINES') {
+        await requestFileConfirmation(tool, result);
+        return; // Wait for confirmation
+      }
+      
+      // Add tool result to conversation
+      const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+      await updateConversation('TOOL RESULT (' + tool.name + '): ' + resultText);
     }
-    
-    // Add the full AI response to conversation (including tools)
-    await updateConversation('ASSISTANT: ' + responseText);
     
     const buildPrompt = require('./message-to-prompt').buildPrompt;
     await buildPrompt();
@@ -505,6 +513,38 @@ async function processResponse() {
   } catch (err) {
     console.error('Error processing response:', err);
   }
+}
+
+async function handleSpecialTool(tool) {
+  switch (tool.name) {
+    case 'DISCOVERED':
+      await handleDiscovery(tool.params);
+      break;
+    case 'SWITCH_TO':
+      await updateMode(tool.params.mode);
+      break;
+    case 'EXPLORATION_FINDINGS':
+      await saveAiDocument('exploration-findings', tool.params);
+      break;
+    case 'DETAILED_PLAN':
+      await saveAiDocument('implementation-plan', tool.params);
+      break;
+  }
+}
+
+async function saveAiDocument(type, params) {
+  if (!params.name) {
+    throw new Error('Missing required "name" field for ' + type);
+  }
+  
+  await utils.ensureDir('ai-docs');
+  const filename = 'ai-docs/' + params.name + '.md';
+  await fs.writeFile(filename, params.content, 'utf8');
+  
+  // Update file structure to include new AI document
+  await utils.updateFileInStructure();
+  
+  console.log('✓ Saved ' + type + ': ' + filename);
 }
 
 async function handleFormatError(errorMessage) {
