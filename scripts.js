@@ -95,6 +95,63 @@ function parseToolBlocks(text) {
   return tools;
 }
 
+function replaceToolsWithIndicators(text, tools) {
+  let result = text;
+  
+  // Sort tools by start index in reverse order so we can replace from end to beginning
+  const sortedTools = tools.slice().sort(function(a, b) { return b.startIndex - a.startIndex; });
+  
+  for (let i = 0; i < sortedTools.length; i++) {
+    const tool = sortedTools[i];
+    let indicator = '';
+    
+    switch (tool.name) {
+      case 'READ_FILE':
+        indicator = '--> Read file: ' + tool.params.file_name;
+        break;
+      case 'SEARCH_FILES_BY_NAME':
+        indicator = '--> Search files by name: ' + tool.params.regex + ' in ' + tool.params.folder;
+        break;
+      case 'SEARCH_FILES_BY_CONTENT':
+        indicator = '--> Search files by content: ' + tool.params.regex + ' in ' + tool.params.folder;
+        break;
+      case 'CREATE_NEW_FILE':
+        indicator = '--> Create file: ' + tool.params.path;
+        break;
+      case 'UPDATE_FILE':
+        indicator = '--> Update file: ' + tool.params.file_name + ' (lines ' + tool.params.start_line + '-' + tool.params.end_line + ')';
+        break;
+      case 'INSERT_LINES':
+        indicator = '--> Insert lines: ' + tool.params.file_name + ' at line ' + tool.params.line_number;
+        break;
+      case 'DELETE_FILE':
+        indicator = '--> Delete file: ' + tool.params.file_name;
+        break;
+      case 'DISCOVERED':
+        indicator = '--> Discovery (importance ' + tool.params.importance + '): ' + tool.params.content;
+        break;
+      case 'SWITCH_TO':
+        indicator = '--> Switch to ' + tool.params.mode + ' mode';
+        break;
+      case 'EXPLORATION_FINDINGS':
+        indicator = '--> Save exploration findings: ' + (tool.params.name || 'findings');
+        break;
+      case 'DETAILED_PLAN':
+        indicator = '--> Save implementation plan: ' + (tool.params.name || 'plan');
+        break;
+      case 'COMMIT':
+        indicator = '--> Commit changes';
+        break;
+      default:
+        indicator = '--> ' + tool.name + ' tool used';
+    }
+    
+    result = result.slice(0, tool.startIndex) + indicator + result.slice(tool.endIndex);
+  }
+  
+  return result;
+}
+
 function hasMessageEnd(text) {
   return text.includes('[[[MESSAGE_END]]]');
 }
