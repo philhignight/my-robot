@@ -66,7 +66,25 @@ function parseToolBlocks(text) {
   
   // Remove the box wrapper if present
   const boxMatch = text.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
-  const content = boxMatch ? boxMatch[1] : text;
+  let content = text;
+  
+  if (boxMatch) {
+    // Extract content and remove box borders from each line
+    const boxContent = boxMatch[1];
+    const lines = boxContent.split('\n');
+    const cleanedLines = [];
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Remove the leading "│ " and trailing " │" or "│"
+      const cleaned = line.replace(/^│\s?/, '').replace(/\s*│\s*$/, '');
+      if (cleaned.length > 0) {
+        cleanedLines.push(cleaned);
+      }
+    }
+    
+    content = cleanedLines.join('\n');
+  }
   
   // Match tool patterns: [TOOLNAME] args on one line, then content until next tool or END tag
   const lines = content.split('\n');
