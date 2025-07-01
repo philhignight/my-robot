@@ -1,4 +1,69 @@
-// utils.js
+async function buildPrompt() {
+  try {
+    await utils.ensureDir('ai-managed');
+    
+    const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
+    const goals = await utils.readFileIfExists('goals.md');
+    const context = await utils.readFileIfExists('ai-managed/context.md');
+    const conversation = await utils.readFileIfExists('conversation.md');
+    const basePrompt = await utils.readFileIfExists('prompts/base.md');
+    const modePrompt = await utils.readFileIfExists('prompts/' + mode + '.md');
+    
+    // Generate 2-level directory listing
+    const listTool = {
+      name: 'LIST',
+      params: { path: '.', maxDepth: 2 }
+    };
+    const projectStructure = await executeTwoLevelList(listTool.params);
+    
+    // Extract just the conversation history
+    const lines = conversation.split('\n');
+    const historyIndex = lines.findIndex(function(line) { return line.includes('=== CONVERSATION HISTORY ==='); });
+    const waitingIndex = lines.findIndex(function(line) { return line.includes('=== WAITING FOR YOUR MESSAGE ==='); });
+    
+    let conversationHistory = '';
+    if (historyIndex !== -1) {
+      // Only get content between history marker and waiting marker
+      if (waitingIndex > historyIndex) {
+        conversationHistory = lines.slice(historyIndex + 1, waitingIndex).join('\n').trim();
+      } else {
+        conversationHistory = lines.slice(historyIndex + 1).join('\n').trim();
+      }
+      
+      // Remove any "=== AI RESPONSE READY ===" lines that might have been left
+      conversationHistory = conversationHistory.split('\n')
+        .filter(function(line) { 
+          return !line.includes('=== AI RESPONSE READY ===') && 
+                 !line.includes('Copy the contents of generated-prompt.md');
+        })
+        .join('\n');
+    }
+    
+    // Check if we need to compact the conversation
+    const estimatedLength = utils.calculatePromptLength(basePrompt, modePrompt, goals, context, conversationHistory);
+    
+    if (estimatedLength > 500000 && conversationHistory.length > 10000) {
+      console.log('📝 Compacting conversation history...');
+      conversationHistory = utils.compactConversation(conversationHistory, 30000);
+      console.log('✓ Conversation compacted');
+    }
+    
+    // Build prompt with conditional sections
+    let prompt = basePrompt + '\n\n' + modePrompt;
+    
+    // Only include goals if it has meaningful content
+    if (goals.trim() && goals.trim() !== '# Project Goals\n\nAdd your high-level objectives here') {
+      prompt += '\n\nGOALS:\n' + goals;
+    }
+    
+    // Add project structure to context
+    let fullContext = 'PROJECT STRUCTURE (2 levels):\n' + projectStructure;
+    if (context.trim()) {
+      fullContext += '\n\nADDITIONAL CONTEXT:\n' + context;
+    }
+    prompt += '\n\nCONTEXT:\n' + fullContext;
+    
+    // Only// utils.js
 const fs = require('fs').promises;
 const path = require('path');
 
