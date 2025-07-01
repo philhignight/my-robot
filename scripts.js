@@ -92,7 +92,7 @@ function parseToolBlocks(text) {
 
 function classifyTools(tools) {
   const informationTools = ['READ_FILE', 'SEARCH_FILES_BY_NAME', 'SEARCH_FILES_BY_CONTENT', 'LIST_DIRECTORY'];
-  const responseTools = ['DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
+  const responseTools = ['RESPONSE_MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
                         'CREATE_NEW_FILE', 'UPDATE_FILE', 'INSERT_LINES', 'DELETE_FILE',
                         'SWITCH_TO', 'COMMIT'];
   
@@ -102,12 +102,12 @@ function classifyTools(tools) {
   if (hasInfoTools && hasResponseTools) {
     return { 
       type: 'mixed', 
-      error: 'Cannot mix information gathering tools with response/action tools'
+      error: 'Cannot mix READ tools with WRITE tools in the same response'
     };
   }
   
-  if (hasInfoTools) return { type: 'information' };
-  if (hasResponseTools) return { type: 'response' };
+  if (hasInfoTools) return { type: 'read' };
+  if (hasResponseTools) return { type: 'write' };
   return { type: 'empty' };
 }
 
@@ -120,8 +120,15 @@ function validateResponseType(text, tools) {
     .replace(/\[\[\[MESSAGE_END\]\]\]/g, '')
     .trim();
   
-  // Check for substantial content (more than just whitespace)
-  const hasContent = responseContent.length > 10;
+  // Check for ANY content outside of tools (should be none)
+  const hasContent = responseContent.length > 0;
+  
+  if (hasContent) {
+    return {
+      valid: false,
+      error: 'No plain text allowed. All content must be inside tool blocks. Use @RESPONSE_MESSAGE for text.'
+    };
+  }
   
   switch (classification.type) {
     case 'mixed':
@@ -130,28 +137,17 @@ function validateResponseType(text, tools) {
         error: classification.error 
       };
       
-    case 'information':
-      if (hasContent) {
-        return { 
-          valid: false, 
-          error: 'Information gathering responses cannot contain text. Use tools only.' 
-        };
-      }
-      return { valid: true, type: 'information' };
+    case 'read':
+      return { valid: true, type: 'read' };
       
-    case 'response':
-      // Response type can have content or not
-      return { valid: true, type: 'response' };
+    case 'write':
+      return { valid: true, type: 'write' };
       
     case 'empty':
-      // No tools - must be a pure text response
-      if (!hasContent) {
-        return { 
-          valid: false, 
-          error: 'Response must contain either tools or text content' 
-        };
-      }
-      return { valid: true, type: 'text' };
+      return { 
+        valid: false, 
+        error: 'Response must contain at least one tool' 
+      };
   }
 }
 
@@ -166,6 +162,10 @@ function replaceToolsWithIndicators(text, tools) {
     let indicator = '';
     
     switch (tool.name) {
+      case 'RESPONSE_MESSAGE':
+        // For response messages, include the full content
+        indicator = tool.params.content || '[Empty message]';
+        break;
       case 'LIST_DIRECTORY':
         indicator = '--> List directory: ' + (tool.params.path || '.') +
           (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
@@ -659,10 +659,10 @@ async function processResponse() {
     console.log('✓ Processing ' + typeValidation.type + ' response');
     
     // Handle based on response type
-    if (typeValidation.type === 'information') {
-      await handleInformationResponse(responseText, tools);
+    if (typeValidation.type === 'read') {
+      await handleReadResponse(responseText, tools);
     } else {
-      await handleResponseWithActions(responseText, tools);
+      await handleWriteResponse(responseText, tools);
     }
     
   } catch (err) {
@@ -674,9 +674,10 @@ async function handleResponseTypeError(errorMessage, responseText) {
   // Don't add the invalid response to conversation
   
   const errorResponse = 'SYSTEM ERROR: ' + errorMessage + '\n\n' +
-    'Response Type Rules:\n' +
-    '1. Information Gathering: Use ONLY read/search/list tools, NO text\n' +
-    '2. Response/Action: Use text and/or action tools, NO read/search/list tools\n\n' +
+    'Response Rules:\n' +
+    '1. READ Response: Use ONLY read/search/list tools, NO other content\n' +
+    '2. WRITE Response: Use @RESPONSE_MESSAGE for text and/or action tools\n' +
+    '3. NO plain text allowed outside of tools\n\n' +
     'Your last response violated these rules. Please try again with the correct response type.';
   
   await updateConversation(errorResponse);
@@ -687,12 +688,12 @@ async function handleResponseTypeError(errorMessage, responseText) {
   console.log('✓ Error prompt ready in generated-prompt.md');
 }
 
-async function handleInformationResponse(responseText, tools) {
-  // For information gathering, just add the indicators to conversation
+async function handleReadResponse(responseText, tools) {
+  // For read responses, just add the indicators to conversation
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   await updateConversation('ASSISTANT: ' + cleanResponse);
   
-  // Process all information gathering tools
+  // Process all read tools
   for (let i = 0; i < tools.length; i++) {
     const tool = tools[i];
     const result = await executeTool(tool);
@@ -706,15 +707,19 @@ async function handleInformationResponse(responseText, tools) {
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  console.log('✓ Information gathering complete, next prompt ready');
+  console.log('✓ Read operations complete, next prompt ready');
 }
 
-async function handleResponseWithActions(responseText, tools) {
+async function handleWriteResponse(responseText, tools) {
   // Replace tool calls with readable indicators in conversation
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   await updateConversation('ASSISTANT: ' + cleanResponse);
   
   // Separate tool types
+  const messageTools = tools.filter(function(t) {
+    return t.name === 'RESPONSE_MESSAGE';
+  });
+  
   const specialTools = tools.filter(function(t) {
     return t.name === 'DISCOVERED' || t.name === 'SWITCH_TO' || 
            t.name === 'EXPLORATION_FINDINGS' || t.name === 'DETAILED_PLAN';
@@ -725,7 +730,10 @@ async function handleResponseWithActions(responseText, tools) {
            t.name === 'INSERT_LINES' || t.name === 'DELETE_FILE';
   });
   
-  // Handle special tools first
+  // Handle RESPONSE_MESSAGE tools - no execution needed, already in conversation
+  // The content is already shown via replaceToolsWithIndicators
+  
+  // Handle special tools
   for (let i = 0; i < specialTools.length; i++) {
     const tool = specialTools[i];
     await handleSpecialTool(tool);
@@ -749,7 +757,7 @@ async function handleResponseWithActions(responseText, tools) {
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  console.log('✓ Response processed, next prompt ready');
+  console.log('✓ Write response processed, next prompt ready');
 }
 
 async function handleFormatError(errorMessage) {
@@ -1247,10 +1255,10 @@ async function createInitialFiles() {
     'goals.md': '# Project Goals\n\nAdd your high-level objectives here',
     'ai-response.md': '',
     'generated-prompt.md': '',
-    'prompts/base.md': '# Base prompt template - create this file with tool format documentation',
-    'prompts/exploration.md': '# EXPLORATION MODE\n\nYour job is to understand the codebase and requirements:\n\n- Use LIST_DIRECTORY to explore project structure\n- Use READ_FILE to examine key files\n- Use SEARCH_FILES_BY_NAME and SEARCH_FILES_BY_CONTENT to discover patterns\n- Ask clarifying questions about requirements  \n- Document findings with DISCOVERED blocks (importance 1-10)\n- When you have sufficient understanding, create/update exploration findings using:\n\nEXPLORATION_FINDINGS: [[[START]]]\n# Key Findings\n\n## Architecture\n- Current system uses X framework\n- Database is Y with Z schema\n\n## Key Issues\n- Problem 1: description\n- Problem 2: description\n\n## Recommendations\n- Next steps for implementation\n[[[END]]]\n\n- Recommend "SWITCH_TO: planning" when ready\n\nFocus on understanding, not solving yet. Be thorough in your exploration.',
-    'prompts/planning.md': '# PLANNING MODE\n\nYour job is to create a detailed implementation plan:\n\n- Review the exploration findings to understand the current state\n- Ask final clarifying questions before implementation  \n- Break down work into specific, concrete tasks with file changes\n- Create detailed-plan.md with step-by-step implementation tasks\n- Each task should specify exactly which files to modify and how\n- Recommend "SWITCH_TO: implementation" when plan is complete\n\nBe thorough - implementation should have no surprises.',
-    'prompts/implementation.md': '# IMPLEMENTATION MODE\n\nYour job is to execute the implementation plan:\n\n- Follow the detailed-plan.md exactly as specified\n- Use UPDATE_FILE, INSERT_LINES, CREATE_NEW_FILE tools to make changes\n- Include descriptive change_description for all file operations  \n- Work through plan items systematically\n- If you hit unexpected issues: "SWITCH_TO: exploration"\n- Focus on execution, not replanning'
+    'prompts/base.md': '# Base prompt template - Update this file with the full prompt from the documentation',
+    'prompts/exploration.md': '# EXPLORATION MODE\n\nYour job is to understand the codebase and requirements:\n\n- Use LIST_DIRECTORY to explore project structure\n- Use READ_FILE to examine key files\n- Use SEARCH_FILES_BY_NAME and SEARCH_FILES_BY_CONTENT to discover patterns\n- Use @RESPONSE_MESSAGE to ask clarifying questions or provide updates\n- Document findings with DISCOVERED blocks (importance 1-10)\n- When you have sufficient understanding, create exploration findings\n\nRemember: NO plain text allowed outside of tools. Use @RESPONSE_MESSAGE for all communication.\n\nFocus on understanding, not solving yet. Be thorough in your exploration.',
+    'prompts/planning.md': '# PLANNING MODE\n\nYour job is to create a detailed implementation plan:\n\n- Review the exploration findings to understand the current state\n- Use @RESPONSE_MESSAGE to ask final clarifying questions\n- Break down work into specific, concrete tasks with file changes\n- Create detailed-plan using @DETAILED_PLAN tool\n- Each task should specify exactly which files to modify and how\n- Use @RESPONSE_MESSAGE to explain your plan\n- Recommend "SWITCH_TO: implementation" when plan is complete\n\nRemember: NO plain text allowed. Use @RESPONSE_MESSAGE for all explanations.\n\nBe thorough - implementation should have no surprises.',
+    'prompts/implementation.md': '# IMPLEMENTATION MODE\n\nYour job is to execute the implementation plan:\n\n- Follow the detailed plan exactly as specified\n- Use UPDATE_FILE, INSERT_LINES, CREATE_NEW_FILE tools to make changes\n- Include descriptive change_description for all file operations\n- Use @RESPONSE_MESSAGE to explain what you\'re doing\n- Work through plan items systematically\n- If you hit unexpected issues: "SWITCH_TO: exploration"\n- Focus on execution, not replanning\n\nRemember: NO plain text allowed. Use @RESPONSE_MESSAGE for all communication.'
   };
 
   const filenames = Object.keys(initialFiles);
