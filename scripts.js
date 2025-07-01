@@ -1305,7 +1305,7 @@ async function moveMessageToHistory(message) {
 
 async function createInitialFiles() {
   const initialFiles = {
-    'conversation.md': '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===',
+    'conversation.md': '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n',
     'mode.md': 'x exploration\n  planning\n  implementation',
     'goals.md': '# Project Goals\n\nAdd your high-level objectives here',
     'ai-response.md': '',
@@ -1404,7 +1404,7 @@ async function reset() {
       const file = filesToClear[i];
       try {
         if (file === 'conversation.md') {
-          await fs.writeFile(file, '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===', 'utf8');
+          await fs.writeFile(file, '=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]\n\n=== CONVERSATION HISTORY ===\n', 'utf8');
         } else if (file === 'pending-changes.json') {
           await fs.unlink(file).catch(() => {}); // Delete if exists, ignore if not
         } else {
