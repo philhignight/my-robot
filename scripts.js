@@ -17,9 +17,6 @@ const CODEBASE_PATH = (function() {
   return './test-project';
 })();
 
-// In-memory file structure cache
-let fileStructure = null;
-
 async function ensureDir(dirPath) {
   try {
     await fs.mkdir(dirPath, { recursive: true });
@@ -94,7 +91,7 @@ function parseToolBlocks(text) {
 }
 
 function classifyTools(tools) {
-  const informationTools = ['READ_FILE', 'SEARCH_FILES_BY_NAME', 'SEARCH_FILES_BY_CONTENT'];
+  const informationTools = ['READ_FILE', 'SEARCH_FILES_BY_NAME', 'SEARCH_FILES_BY_CONTENT', 'LIST_DIRECTORY'];
   const responseTools = ['DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
                         'CREATE_NEW_FILE', 'UPDATE_FILE', 'INSERT_LINES', 'DELETE_FILE',
                         'SWITCH_TO', 'COMMIT'];
@@ -169,6 +166,10 @@ function replaceToolsWithIndicators(text, tools) {
     let indicator = '';
     
     switch (tool.name) {
+      case 'LIST_DIRECTORY':
+        indicator = '--> List directory: ' + (tool.params.path || '.') +
+          (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
+        break;
       case 'READ_FILE':
         indicator = '--> Read file: ' + tool.params.file_name + 
           (tool.params.explanation ? ' (' + tool.params.explanation + ')' : '');
@@ -483,63 +484,8 @@ function compactConversation(conversationHistory, maxLength) {
   return summary;
 }
 
-function calculatePromptLength(basePrompt, modePrompt, goals, fileStructure, context, conversationHistory) {
-  return (basePrompt + modePrompt + goals + fileStructure + context + conversationHistory).length;
-}
-
-async function generateFileStructure() {
-  let structure = await buildDirectoryTree(CODEBASE_PATH, 0);
-  
-  // Add AI working documents
-  const aiDocsPath = path.join(__dirname, 'ai-docs');
-  try {
-    const aiDocsExists = await fs.access(aiDocsPath).then(() => true).catch(() => false);
-    if (aiDocsExists) {
-      structure += '\nAI WORKING DOCUMENTS:\n';
-      const aiDocs = await buildDirectoryTree(aiDocsPath, 0);
-      structure += aiDocs;
-      structure += '\n(This is your working area for saving exploration findings, implementation plans, and other documentation)\n';
-    }
-  } catch (err) {
-    // AI docs folder doesn't exist yet, that's fine
-  }
-  
-  fileStructure = structure;
-  return structure;
-}
-
-async function buildDirectoryTree(dirPath, depth) {
-  const indent = '  '.repeat(depth);
-  let result = '';
-  
-  try {
-    const entries = await fs.readdir(dirPath, { withFileTypes: true });
-    
-    const dirs = entries.filter(function(e) { return e.isDirectory(); }).sort(function(a, b) { return a.name.localeCompare(b.name); });
-    const files = entries.filter(function(e) { return e.isFile(); }).sort(function(a, b) { return a.name.localeCompare(b.name); });
-    
-    for (let i = 0; i < dirs.length; i++) {
-      const dir = dirs[i];
-      if (dir.name.startsWith('.')) continue;
-      
-      result += indent + dir.name + '/\n';
-      const subdirPath = path.join(dirPath, dir.name);
-      result += await buildDirectoryTree(subdirPath, depth + 1);
-    }
-    
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (file.name.startsWith('.')) continue;
-      
-      const filePath = path.join(dirPath, file.name);
-      const lineCount = await getLineCount(filePath);
-      result += indent + file.name + ' (' + lineCount + ' lines)\n';
-    }
-  } catch (err) {
-    result += indent + '[Error reading directory: ' + err.message + ']\n';
-  }
-  
-  return result;
+function calculatePromptLength(basePrompt, modePrompt, goals, context, conversationHistory) {
+  return (basePrompt + modePrompt + goals + context + conversationHistory).length;
 }
 
 async function getLineCount(filePath) {
@@ -551,12 +497,30 @@ async function getLineCount(filePath) {
   }
 }
 
-async function updateFileInStructure() {
-  fileStructure = await generateFileStructure();
-}
-
-function getFileStructure() {
-  return fileStructure || '';
+async function countFilesInDir(dirPath) {
+  let count = 0;
+  
+  async function countDir(dir) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.name.startsWith('.')) continue;
+        
+        if (entry.isFile()) {
+          count++;
+        } else if (entry.isDirectory()) {
+          await countDir(path.join(dir, entry.name));
+        }
+      }
+    } catch (err) {
+      // Skip inaccessible directories
+    }
+  }
+  
+  await countDir(dirPath);
+  return count;
 }
 
 function getCodebasePath(relativePath) {
@@ -582,9 +546,8 @@ module.exports = {
   compactDiscoveries: compactDiscoveries,
   compactConversation: compactConversation,
   calculatePromptLength: calculatePromptLength,
-  generateFileStructure: generateFileStructure,
-  updateFileInStructure: updateFileInStructure,
-  getFileStructure: getFileStructure,
+  getLineCount: getLineCount,
+  countFilesInDir: countFilesInDir,
   getCodebasePath: getCodebasePath
 };
 
@@ -598,19 +561,12 @@ async function buildPrompt() {
   try {
     await utils.ensureDir('ai-managed');
     
-    if (!utils.getFileStructure()) {
-      console.log('🔍 Generating project file structure...');
-      await utils.generateFileStructure();
-      console.log('✓ File structure generated');
-    }
-    
     const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
     const goals = await utils.readFileIfExists('goals.md');
     const context = await utils.readFileIfExists('ai-managed/context.md');
     const conversation = await utils.readFileIfExists('conversation.md');
     const basePrompt = await utils.readFileIfExists('prompts/base.md');
     const modePrompt = await utils.readFileIfExists('prompts/' + mode + '.md');
-    const fileStructure = utils.getFileStructure();
     
     // Extract just the conversation history
     const lines = conversation.split('\n');
@@ -621,7 +577,7 @@ async function buildPrompt() {
     }
     
     // Check if we need to compact the conversation
-    const estimatedLength = utils.calculatePromptLength(basePrompt, modePrompt, goals, fileStructure, context, conversationHistory);
+    const estimatedLength = utils.calculatePromptLength(basePrompt, modePrompt, goals, context, conversationHistory);
     
     if (estimatedLength > 500000 && conversationHistory.length > 10000) {
       console.log('📝 Compacting conversation history...');
@@ -630,7 +586,7 @@ async function buildPrompt() {
     }
     
     // Build prompt with conditional sections
-    let prompt = basePrompt + '\n\n' + modePrompt + '\n\nGOALS:\n' + goals + '\n\nPROJECT STRUCTURE:\n' + fileStructure;
+    let prompt = basePrompt + '\n\n' + modePrompt + '\n\nGOALS:\n' + goals;
     
     // Only include context if it has content
     if (context.trim()) {
@@ -719,8 +675,8 @@ async function handleResponseTypeError(errorMessage, responseText) {
   
   const errorResponse = 'SYSTEM ERROR: ' + errorMessage + '\n\n' +
     'Response Type Rules:\n' +
-    '1. Information Gathering: Use ONLY read/search tools, NO text\n' +
-    '2. Response/Action: Use text and/or action tools, NO read/search tools\n\n' +
+    '1. Information Gathering: Use ONLY read/search/list tools, NO text\n' +
+    '2. Response/Action: Use text and/or action tools, NO read/search/list tools\n\n' +
     'Your last response violated these rules. Please try again with the correct response type.';
   
   await updateConversation(errorResponse);
@@ -838,9 +794,6 @@ async function saveAiDocument(type, params) {
   const filename = 'ai-docs/' + params.name + '.md';
   await fs.writeFile(filename, params.content, 'utf8');
   
-  // Update file structure to include new AI document
-  await utils.updateFileInStructure();
-  
   console.log('✓ Saved ' + type + ': ' + filename);
 }
 
@@ -883,6 +836,8 @@ async function updateMode(newMode) {
 
 async function executeTool(tool) {
   switch (tool.name) {
+    case 'LIST_DIRECTORY':
+      return await executeListDirectory(tool.params);
     case 'READ_FILE':
       return await executeReadFile(tool.params);
     case 'SEARCH_FILES_BY_NAME':
@@ -899,6 +854,53 @@ async function executeTool(tool) {
       return await executeDeleteFile(tool.params);
     default:
       return 'Unknown tool: ' + tool.name;
+  }
+}
+
+async function executeListDirectory(params) {
+  try {
+    const dirPath = utils.getCodebasePath(params.path || '.');
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    
+    const dirs = [];
+    const files = [];
+    
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      if (entry.name.startsWith('.')) continue;
+      
+      if (entry.isDirectory()) {
+        const subPath = path.join(dirPath, entry.name);
+        const fileCount = await utils.countFilesInDir(subPath);
+        dirs.push(entry.name + '/ (' + fileCount + ' files)');
+      } else {
+        const filePath = path.join(dirPath, entry.name);
+        const lineCount = await utils.getLineCount(filePath);
+        files.push(entry.name + ' (' + lineCount + ' lines)');
+      }
+    }
+    
+    let result = 'Contents of ' + (params.path || '.') + ':\n';
+    if (dirs.length > 0) {
+      result += 'Directories:\n';
+      for (let i = 0; i < dirs.length; i++) {
+        result += '  ' + dirs[i] + '\n';
+      }
+    }
+    if (files.length > 0) {
+      result += 'Files:\n';
+      for (let i = 0; i < files.length; i++) {
+        result += '  ' + files[i] + '\n';
+      }
+    }
+    
+    if (dirs.length === 0 && files.length === 0) {
+      result += '[Empty directory]';
+    }
+    
+    return result;
+  } catch (err) {
+    return 'Error listing directory: ' + err.message;
   }
 }
 
@@ -960,8 +962,6 @@ async function executeCreateFile(params) {
     const filePath = utils.getCodebasePath(params.path);
     await utils.ensureDir(path.dirname(filePath));
     await fs.writeFile(filePath, params.contents, 'utf8');
-    
-    await utils.updateFileInStructure();
     
     return '✓ Created ' + params.path;
   } catch (err) {
@@ -1030,8 +1030,6 @@ async function executeDeleteFile(params) {
   try {
     const filePath = utils.getCodebasePath(params.file_name);
     await fs.unlink(filePath);
-    
-    await utils.updateFileInStructure();
     
     return '✓ Deleted ' + params.file_name;
   } catch (err) {
@@ -1114,7 +1112,6 @@ async function handlePendingUpdate(responseText) {
     
     console.log('✓ Committed changes to ' + pendingData.file);
     
-    await utils.updateFileInStructure();
     await gitCommitAndPush(pendingData.file, pendingData.description);
     
     await updateConversation('SYSTEM: Changes committed to ' + pendingData.file + ' and pushed to git');
@@ -1251,7 +1248,7 @@ async function createInitialFiles() {
     'ai-response.md': '',
     'generated-prompt.md': '',
     'prompts/base.md': '# Base prompt template - create this file with tool format documentation',
-    'prompts/exploration.md': '# EXPLORATION MODE\n\nYour job is to understand the codebase and requirements:\n\n- Use READ_FILE to examine key files\n- Use SEARCH_FILES_BY_NAME and SEARCH_FILES_BY_CONTENT to discover patterns\n- Ask clarifying questions about requirements  \n- Document findings with DISCOVERED blocks (importance 1-10)\n- When you have sufficient understanding, create/update exploration findings using:\n\nEXPLORATION_FINDINGS: [[[START]]]\n# Key Findings\n\n## Architecture\n- Current system uses X framework\n- Database is Y with Z schema\n\n## Key Issues\n- Problem 1: description\n- Problem 2: description\n\n## Recommendations\n- Next steps for implementation\n[[[END]]]\n\n- Recommend "SWITCH_TO: planning" when ready\n\nFocus on understanding, not solving yet. Be thorough in your exploration.',
+    'prompts/exploration.md': '# EXPLORATION MODE\n\nYour job is to understand the codebase and requirements:\n\n- Use LIST_DIRECTORY to explore project structure\n- Use READ_FILE to examine key files\n- Use SEARCH_FILES_BY_NAME and SEARCH_FILES_BY_CONTENT to discover patterns\n- Ask clarifying questions about requirements  \n- Document findings with DISCOVERED blocks (importance 1-10)\n- When you have sufficient understanding, create/update exploration findings using:\n\nEXPLORATION_FINDINGS: [[[START]]]\n# Key Findings\n\n## Architecture\n- Current system uses X framework\n- Database is Y with Z schema\n\n## Key Issues\n- Problem 1: description\n- Problem 2: description\n\n## Recommendations\n- Next steps for implementation\n[[[END]]]\n\n- Recommend "SWITCH_TO: planning" when ready\n\nFocus on understanding, not solving yet. Be thorough in your exploration.',
     'prompts/planning.md': '# PLANNING MODE\n\nYour job is to create a detailed implementation plan:\n\n- Review the exploration findings to understand the current state\n- Ask final clarifying questions before implementation  \n- Break down work into specific, concrete tasks with file changes\n- Create detailed-plan.md with step-by-step implementation tasks\n- Each task should specify exactly which files to modify and how\n- Recommend "SWITCH_TO: implementation" when plan is complete\n\nBe thorough - implementation should have no surprises.',
     'prompts/implementation.md': '# IMPLEMENTATION MODE\n\nYour job is to execute the implementation plan:\n\n- Follow the detailed-plan.md exactly as specified\n- Use UPDATE_FILE, INSERT_LINES, CREATE_NEW_FILE tools to make changes\n- Include descriptive change_description for all file operations  \n- Work through plan items systematically\n- If you hit unexpected issues: "SWITCH_TO: exploration"\n- Focus on execution, not replanning'
   };
@@ -1274,10 +1271,6 @@ function startWatching() {
   
   createInitialFiles().then(function() {
     console.log('✓ Initial files ready');
-    
-    return utils.generateFileStructure();
-  }).then(function() {
-    console.log('✓ Project file structure initialized');
     console.log('💡 Edit conversation.md to get started!');
   }).catch(function(err) {
     console.error('⚠ Error during initialization:', err.message);
