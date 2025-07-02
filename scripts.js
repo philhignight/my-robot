@@ -477,10 +477,8 @@ async function updateMode(newMode) {
 
 async function executeTool(tool) {
   switch (tool.name) {
-    case 'LIST':
-      return await executeListDirectory(tool.params);
     case 'READ':
-      return await executeReadFile(tool.params);
+      return await executeRead(tool.params);
     case 'SEARCH_NAME':
       return await executeSearchFilesByName(tool.params);
     case 'SEARCH_CONTENT':
@@ -581,6 +579,29 @@ async function executeListDirectory(params) {
     return result;
   } catch (err) {
     return 'Error listing directory: ' + err.message;
+  }
+}
+
+async function executeRead(params) {
+  try {
+    const targetPath = utils.getCodebasePath(params.file_name || params.path || '.');
+    
+    // Check if it's a directory or file
+    const stats = await fs.stat(targetPath);
+    
+    if (stats.isDirectory()) {
+      // Execute directory listing
+      return await executeListDirectory({ path: params.file_name || params.path || '.' });
+    } else {
+      // Execute file reading
+      return await executeReadFile({ file_name: params.file_name || params.path });
+    }
+  } catch (err) {
+    // If stat fails, try as file first (backward compatibility)
+    if (err.code === 'ENOENT') {
+      return 'Error: ' + (params.file_name || params.path || '.') + ' not found';
+    }
+    return 'Error reading ' + (params.file_name || params.path || '.') + ': ' + err.message;
   }
 }
 
@@ -981,7 +1002,7 @@ const utils = require('./utils');
 const { generatePrompt } = require('./prompt-generator');
 const { allocatePromptBudget, buildPromptFromAllocations } = require('./prompt-budget-allocator');
 
-async function executeTwoLevelList(params) {
+async function executeTwoLevelRead(params) {
   try {
     const dirPath = utils.getCodebasePath(params.path || '.');
     
@@ -1084,11 +1105,11 @@ async function buildPrompt() {
     const detailedPlan = await utils.readFileIfExists('ai-managed/detailed-plan.md');
     
     // Generate 2-level directory listing
-    const listTool = {
-      name: 'LIST',
+    const readTool = {
+      name: 'READ',
       params: { path: '.', maxDepth: 2 }
     };
-    const projectStructure = await executeTwoLevelList(listTool.params);
+    const projectStructure = await executeTwoLevelRead(readTool.params);
     
     // Extract just the conversation history
     const lines = conversation.split('\n');
@@ -1378,13 +1399,9 @@ function parseToolParams(toolName, args, content) {
   }
   
   switch (toolName) {
-    case 'LIST':
-      params.path = args || '.';
-      params.explanation = content;
-      break;
-      
     case 'READ':
-      params.file_name = args;
+      params.file_name = args || '.';  // Default to current directory
+      params.path = args || '.';  // Support both for compatibility
       params.explanation = content;
       break;
       
@@ -1497,7 +1514,7 @@ function parseToolParams(toolName, args, content) {
 }
 
 function classifyTools(tools) {
-  const informationTools = ['LIST', 'READ', 'SEARCH_NAME', 'SEARCH_CONTENT'];
+  const informationTools = ['READ', 'SEARCH_NAME', 'SEARCH_CONTENT'];
   const responseTools = ['MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
                         'CREATE', 'UPDATE', 'INSERT', 'DELETE',
                         'SWITCH_TO', 'SWITCH_TO_EXPLORATION', 'SWITCH_TO_PLANNING', 
@@ -2044,7 +2061,7 @@ You are an AI development assistant helping with requirements analysis and code 
 │ Your message content here, wrapped at 70 characters for             │
 │ ... readability. Long lines will automatically wrap with "..."      │
 │                                                                     │
-│ [LIST] .                                                            │
+│ [READ] .                                                            │
 │ Getting project overview                                            │
 │                                                                     │
 │ [SEARCH_NAME] .*very-long-pattern-that-exceeds-width.*$ src/folder  │
@@ -2062,7 +2079,6 @@ Complete these tasks:
 #1 Decide if you need to READ or WRITE to complete the next assistant message, then choose the corresponding response type.
 
 Tools allowed in the READ response type:
-- [LIST]
 - [READ]
 - [SEARCH_NAME]
 - [SEARCH_CONTENT]
@@ -2077,8 +2093,7 @@ const MODE_CONFIGS = {
 
 Your job is to understand the codebase and requirements:
 
-- Use LIST to explore project structure
-- Use READ to examine key files
+- Use READ to explore project structure and examine files
 - Use SEARCH_NAME and SEARCH_CONTENT to discover patterns
 - Use MESSAGE to ask clarifying questions or provide updates
 - Document findings with DISCOVERED blocks (importance 1-10)
@@ -2130,22 +2145,23 @@ Remember: NO plain text allowed. Use [MESSAGE] for all communication.`
 // Tool documentation
 const TOOL_DOCS = {
   // READ tools (always available)
-  LIST: `**[LIST] path**
-List directory contents. Path is optional (defaults to .)
-\`\`\`
-[LIST] src/
-Exploring source directory
-\`\`\``,
-
-  READ: `**[READ] filename**
-Read file contents with line numbers. You can use multiple READ commands in one response to examine multiple files efficiently.
+  READ: `**[READ] path**
+Read file contents or list directory contents. Path defaults to current directory (.).
+For files: shows content with line numbers. For directories: shows file tree.
+You can use multiple READ commands in one response to examine multiple items efficiently.
 NOTE: You can only read text files. Binary files (jar, zip, exe, images, etc.) are not allowed.
 \`\`\`
+[READ] .
+List current directory contents
+
+[READ] src/
+List src directory contents
+
 [READ] package.json
-Checking project dependencies
+Read package.json file
 
 [READ] src/index.js
-Examining entry point
+Read the main entry point
 
 [READ] src/config.js
 Reviewing configuration
@@ -2296,8 +2312,8 @@ Only use [END_X] tags when:
 Example needing END tag:
 \`\`\`
 [MESSAGE]
-To list files, use [LIST] with a path.
-To read files, use [READ] with a filename.
+To read files or directories, use [READ] with a path.
+To search by name, use [SEARCH_NAME] with a pattern.
 [END_MESSAGE]
 \`\`\`
 
@@ -2351,7 +2367,7 @@ Found Express.js authentication setup with session management
 - **Always include [MESSAGE]**: In WRITE responses, start with [MESSAGE] for any text
 - **Use positional parameters**: Tools now use positions, not named parameters
 - **Smart termination**: Tools end at next tool line or box closure
-- **Progressive discovery**: Start with [LIST] at root, explore as needed
+- **Progressive discovery**: Start with [READ] . at root, explore as needed
 - **One file operation at a time**: For [UPDATE] and [INSERT] operations
 - **Document importance**: Rate [DISCOVERED] items 1-10
 - **# Description pattern**: Use # for descriptions in [CREATE], [UPDATE], [INSERT]
@@ -2390,11 +2406,11 @@ function generatePrompt(options) {
   // Build the write tools list for this mode
   let writeToolsList = '- ' + config.writeTools.join('\n- ');
   
-  // Build tool documentation for this mode
+  // Tool documentation rebuild to include READ-specific docs
   let toolDocs = '\n\n#2 Generate your response inside the ASCII box using ONLY tools from your chosen type.\n\n## TOOL FORMATS (POSITIONAL PARAMETERS)\n\n### READ Tools (Information Gathering)\n\n';
   
   // Add READ tool docs (always available)
-  toolDocs += [TOOL_DOCS.LIST, TOOL_DOCS.READ, TOOL_DOCS.SEARCH_NAME, TOOL_DOCS.SEARCH_CONTENT].join('\n\n');
+  toolDocs += [TOOL_DOCS.READ, TOOL_DOCS.SEARCH_NAME, TOOL_DOCS.SEARCH_CONTENT].join('\n\n');
   
   // Add WRITE tool docs (mode-specific)
   toolDocs += '\n\n### WRITE Tools (Response and Actions)\n\n';
@@ -2446,492 +2462,3 @@ function generatePrompt(options) {
 }
 
 module.exports = { generatePrompt };
-
-// ==========================================
-
-// prompt-budget-allocator.js
-
-const utils = require('./utils');
-
-// Constants
-const BUDGET_LIMIT = 590000; // 590k characters
-const BUDGET_TARGET = 0.95; // Use 95% of budget before summarizing
-
-// Calculate importance weight (same as existing system)
-function calculateImportanceWeight(importance) {
-  return Math.pow(2.5, importance - 1);
-}
-
-// Calculate recency factor with exponential decay
-function calculateRecencyFactor(date, currentDate) {
-  const ageInDays = (currentDate - date) / (1000 * 60 * 60 * 24);
-  // Exponential decay: newer items have factor close to 1, older items decay
-  // Half-life of 30 days (after 30 days, recency factor is 0.5)
-  return Math.exp(-0.693 * ageInDays / 30);
-}
-
-// Parse discovery entry
-function parseDiscovery(line) {
-  const match = line.match(/^\[([^\]]+)\] importance:(\d+) (.+)$/);
-  if (!match) return null;
-  
-  return {
-    date: new Date(match[1]),
-    importance: parseInt(match[2]),
-    content: match[3],
-    originalLine: line
-  };
-}
-
-// Score discoveries by importance and recency
-function scoreDiscoveries(discoveries, currentDate) {
-  if (!currentDate) currentDate = new Date();
-  
-  const scored = [];
-  const lines = discoveries.split('\n').filter(line => line.trim());
-  
-  for (const line of lines) {
-    const parsed = parseDiscovery(line);
-    if (!parsed) continue;
-    
-    const importanceWeight = calculateImportanceWeight(parsed.importance);
-    const recencyFactor = calculateRecencyFactor(parsed.date, currentDate);
-    
-    scored.push({
-      ...parsed,
-      importanceWeight,
-      recencyFactor,
-      score: importanceWeight * recencyFactor
-    });
-  }
-  
-  // Sort by score (highest first), with importance 10 always at top
-  return scored.sort((a, b) => {
-    // Importance 10 always stays at top
-    if (a.importance === 10 && b.importance !== 10) return -1;
-    if (b.importance === 10 && a.importance !== 10) return 1;
-    if (a.importance === 10 && b.importance === 10) {
-      // Both are 10, sort by recency
-      return b.date - a.date;
-    }
-    // Otherwise sort by combined score
-    return b.score - a.score;
-  });
-}
-
-// Category definitions
-const CATEGORY_CONFIGS = {
-  basePrompt: {
-    weight: 0, // Mandatory, always included
-    required: true,
-    selector: (content) => content,
-    summarizer: null // Cannot be summarized
-  },
-  
-  conversation: {
-    weight: 40,
-    required: false,
-    selector: (content) => {
-      // Split conversation into individual exchanges
-      const lines = content.split('\n');
-      const exchanges = [];
-      let currentExchange = [];
-      let inAssistantBox = false;
-      
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        
-        // Check if this starts a new user message
-        if (line.startsWith('> ') && currentExchange.length > 0 && !inAssistantBox) {
-          // Save previous exchange
-          exchanges.push(currentExchange.join('\n'));
-          currentExchange = [line];
-        } else {
-          currentExchange.push(line);
-          
-          // Track assistant box state
-          if (line.includes('┌─ ASSISTANT')) {
-            inAssistantBox = true;
-          } else if (line.includes('└─') && inAssistantBox) {
-            inAssistantBox = false;
-          }
-        }
-      }
-      
-      // Don't forget the last exchange
-      if (currentExchange.length > 0) {
-        exchanges.push(currentExchange.join('\n'));
-      }
-      
-      // Return in reverse order (most recent first)
-      return exchanges.reverse();
-    },
-    summarizer: (excluded) => {
-      if (excluded.length === 0) return '';
-      
-      // Extract key points from excluded exchanges
-      const decisions = [];
-      const questions = [];
-      
-      for (const exchange of excluded) {
-        const lines = exchange.split('\n');
-        for (const line of lines) {
-          if (line.includes('implement') || line.includes('create') || line.includes('build')) {
-            decisions.push(line.trim());
-          }
-          if (line.startsWith('> ') && line.includes('?')) {
-            questions.push(line.trim());
-          }
-        }
-      }
-      
-      let summary = '=== CONVERSATION SUMMARY ===\n';
-      summary += `${excluded.length} earlier exchanges summarized:\n`;
-      
-      if (decisions.length > 0) {
-        summary += '\nKey Decisions:\n';
-        decisions.slice(0, 5).forEach(d => summary += `- ${d}\n`);
-      }
-      
-      if (questions.length > 0) {
-        summary += '\nKey Questions:\n';
-        questions.slice(0, 3).forEach(q => summary += `- ${q}\n`);
-      }
-      
-      return summary;
-    }
-  },
-  
-  discoveries: {
-    weight: 25,
-    required: false,
-    selector: (content, currentDate) => {
-      const scored = scoreDiscoveries(content, currentDate);
-      return scored.map(d => d.originalLine);
-    },
-    summarizer: (excluded) => {
-      if (excluded.length === 0) return '';
-      
-      // Group by importance
-      const groups = {
-        critical: [], // 9-10
-        important: [], // 6-8
-        normal: [], // 4-5
-        minor: [] // 1-3
-      };
-      
-      for (const line of excluded) {
-        const parsed = parseDiscovery(line);
-        if (!parsed) continue;
-        
-        if (parsed.importance >= 9) groups.critical.push(parsed);
-        else if (parsed.importance >= 6) groups.important.push(parsed);
-        else if (parsed.importance >= 4) groups.normal.push(parsed);
-        else groups.minor.push(parsed);
-      }
-      
-      let summary = '=== DISCOVERY SUMMARY ===\n';
-      summary += `${excluded.length} discoveries not shown in detail:\n`;
-      
-      if (groups.critical.length > 0) {
-        summary += `\nCritical (9-10): ${groups.critical.length} findings\n`;
-        groups.critical.slice(0, 3).forEach(d => 
-          summary += `- [${d.date.toISOString().split('T')[0]}] ${d.content.substring(0, 80)}...\n`
-        );
-      }
-      
-      if (groups.important.length > 0) {
-        summary += `\nImportant (6-8): ${groups.important.length} findings\n`;
-        groups.important.slice(0, 2).forEach(d => 
-          summary += `- ${d.content.substring(0, 60)}...\n`
-        );
-      }
-      
-      if (groups.normal.length > 0) {
-        summary += `\nNormal (4-5): ${groups.normal.length} findings\n`;
-      }
-      
-      if (groups.minor.length > 0) {
-        summary += `Minor (1-3): ${groups.minor.length} findings\n`;
-      }
-      
-      return summary;
-    }
-  },
-  
-  projectStructure: {
-    weight: 15,
-    required: false,
-    selector: (content) => content,
-    summarizer: (content) => {
-      const lines = content.split('\n');
-      const fileCount = lines.filter(l => l.includes(' lines)')).length;
-      const dirCount = lines.filter(l => l.includes('/')).length;
-      return `=== PROJECT STRUCTURE SUMMARY ===\nLarge project: ${fileCount} files across ${dirCount} directories\n`;
-    }
-  },
-  
-  detailedPlan: {
-    weight: 20,
-    required: false,
-    modes: ['planning', 'implementation'],
-    selector: (content) => content,
-    summarizer: (content) => {
-      const lines = content.split('\n');
-      const tasks = lines.filter(l => l.match(/^\d+\./));
-      return `=== PLAN SUMMARY ===\nImplementation plan with ${tasks.length} tasks\n` +
-             tasks.slice(0, 5).join('\n') + 
-             (tasks.length > 5 ? `\n... and ${tasks.length - 5} more tasks` : '');
-    }
-  },
-  
-  explorationFindings: {
-    weight: 20,
-    required: false,
-    selector: (content) => content,
-    summarizer: (content) => {
-      const lines = content.split('\n');
-      const headers = lines.filter(l => l.startsWith('#'));
-      return `=== EXPLORATION SUMMARY ===\n` +
-             `Key sections: ${headers.slice(0, 3).join(', ')}\n` +
-             `Total findings: ${lines.length} lines\n`;
-    }
-  },
-  
-  goals: {
-    weight: 5,
-    required: false,
-    selector: (content) => content,
-    summarizer: null // Usually short
-  },
-  
-  additionalContext: {
-    weight: 10,
-    required: false,
-    selector: (content) => content,
-    summarizer: (content) => {
-      const lines = content.split('\n');
-      return `=== CONTEXT SUMMARY ===\n${lines.slice(0, 3).join('\n')}...\n(${lines.length} total lines)\n`;
-    }
-  }
-};
-
-// Main allocation function
-function allocatePromptBudget(inputs, mode, currentDate) {
-  const budget = BUDGET_LIMIT;
-  const targetUsage = budget * BUDGET_TARGET;
-  
-  // Filter categories by mode and availability
-  const activeCategories = [];
-  for (const [name, config] of Object.entries(CATEGORY_CONFIGS)) {
-    // Skip if mode-specific and not in current mode
-    if (config.modes && !config.modes.includes(mode)) continue;
-    
-    // Skip if no content provided
-    if (!inputs[name] || inputs[name].trim() === '') continue;
-    
-    // Skip goals if it's the default
-    if (name === 'goals' && inputs[name].trim() === '# Project Goals\n\nAdd your high-level objectives here') continue;
-    
-    activeCategories.push({
-      name,
-      config,
-      content: inputs[name],
-      weight: config.weight
-    });
-  }
-  
-  // Start with required content
-  let usedBudget = 0;
-  const allocations = {};
-  
-  // Add mandatory content first
-  for (const category of activeCategories) {
-    if (category.config.required) {
-      allocations[category.name] = {
-        content: category.content,
-        excluded: [],
-        summary: ''
-      };
-      usedBudget += category.content.length;
-    }
-  }
-  
-  // Calculate total weight for proportional allocation
-  const totalWeight = activeCategories
-    .filter(c => !c.config.required && c.weight > 0)
-    .reduce((sum, c) => sum + c.weight, 0);
-  
-  // Sort by weight (highest first)
-  const prioritizedCategories = activeCategories
-    .filter(c => !c.config.required)
-    .sort((a, b) => b.weight - a.weight);
-  
-  // Allocate content to each category
-  for (const category of prioritizedCategories) {
-    const { name, config, content } = category;
-    
-    // Calculate this category's budget
-    const categoryBudget = config.weight > 0 
-      ? Math.floor((targetUsage - usedBudget) * (config.weight / totalWeight))
-      : content.length; // Categories with 0 weight get their full content if space allows
-    
-    // Get selectable units (exchanges, discoveries, etc)
-    const units = config.selector ? config.selector(content, currentDate) : [content];
-    
-    let includedContent = '';
-    let excludedContent = [];
-    let currentSize = 0;
-    
-    // Add units until we exceed budget
-    for (let i = 0; i < units.length; i++) {
-      const unit = units[i];
-      const unitSize = unit.length + (i > 0 ? 1 : 0); // +1 for newline
-      
-      if (currentSize + unitSize <= categoryBudget || currentSize === 0) {
-        if (i > 0) includedContent += '\n';
-        includedContent += unit;
-        currentSize += unitSize;
-      } else {
-        excludedContent.push(unit);
-      }
-    }
-    
-    allocations[name] = {
-      content: includedContent,
-      excluded: excludedContent,
-      summary: ''
-    };
-    
-    usedBudget += includedContent.length;
-  }
-  
-  // Generate summaries for excluded content with remaining budget
-  const remainingBudget = budget - usedBudget;
-  let summaryBudget = remainingBudget;
-  
-  for (const category of prioritizedCategories) {
-    const { name, config } = category;
-    const allocation = allocations[name];
-    
-    if (allocation && allocation.excluded.length > 0 && config.summarizer && summaryBudget > 0) {
-      const summary = config.summarizer(allocation.excluded);
-      if (summary && summary.length <= summaryBudget) {
-        allocation.summary = summary;
-        summaryBudget -= summary.length;
-      }
-    }
-  }
-  
-  return {
-    allocations,
-    totalUsed: Object.values(allocations).reduce((sum, a) => 
-      sum + a.content.length + a.summary.length, 0
-    ),
-    budget: budget
-  };
-}
-
-// Helper to build the final prompt from allocations
-function buildPromptFromAllocations(allocations, mode) {
-  const sections = [];
-  
-  // Base prompt is always first
-  if (allocations.basePrompt) {
-    sections.push(allocations.basePrompt.content);
-  }
-  
-  // Add goals if present
-  if (allocations.goals) {
-    sections.push('GOALS:\n' + allocations.goals.content.trim());
-  }
-  
-  // Add project structure
-  if (allocations.projectStructure) {
-    if (allocations.projectStructure.summary) {
-      sections.push(allocations.projectStructure.summary.trim());
-    } else {
-      sections.push('PROJECT STRUCTURE (2 levels):\n' + allocations.projectStructure.content);
-    }
-  }
-  
-  // Add additional context
-  if (allocations.additionalContext) {
-    if (allocations.additionalContext.summary) {
-      sections.push(allocations.additionalContext.summary.trim());
-    } else {
-      sections.push('ADDITIONAL CONTEXT:\n' + allocations.additionalContext.content);
-    }
-  }
-  
-  // Add exploration findings
-  if (allocations.explorationFindings) {
-    if (allocations.explorationFindings.summary) {
-      sections.push(allocations.explorationFindings.summary.trim());
-    } else {
-      sections.push('EXPLORATION FINDINGS:\n' + allocations.explorationFindings.content);
-    }
-  }
-  
-  // Add detailed plan
-  if (allocations.detailedPlan) {
-    if (allocations.detailedPlan.summary) {
-      sections.push(allocations.detailedPlan.summary.trim());
-    } else {
-      sections.push('DETAILED PLAN:\n' + allocations.detailedPlan.content);
-    }
-  }
-  
-  // Add discoveries
-  if (allocations.discoveries) {
-    if (allocations.discoveries.summary) {
-      sections.push(allocations.discoveries.summary.trim());
-    }
-    if (allocations.discoveries.content) {
-      sections.push('DISCOVERIES:\n' + allocations.discoveries.content);
-    }
-  }
-  
-  // Add conversation history
-  if (allocations.conversation) {
-    let conversationSection = 'CONVERSATION HISTORY:\n\n';
-    
-    // Add example if needed
-    conversationSection += '> Are you ready to help?\n\nASSISTANT: yes\n\n' +
-      '> Your response is not in the correct format. You MUST wrap your response in an ascii box (your first output line must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐") and you can ONLY use tool uses, not free form text.\n\n' +
-      '┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n' +
-      '│ [MESSAGE]                                                           │\n' +
-      '│ Here\'s another message in your specified format. Is this correct?   │\n' +
-      '└─────────────────────────────────────────────────────────────────────┘\n\n' +
-      '> yes\n\n' +
-      '┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n' +
-      '│ [MESSAGE]                                                           │\n' +
-      '│ How can I help you?                                                 │\n' +
-      '└─────────────────────────────────────────────────────────────────────┘\n\n';
-    
-    if (allocations.conversation.summary) {
-      conversationSection += allocations.conversation.summary + '\n\n';
-    }
-    
-    conversationSection += allocations.conversation.content;
-    sections.push(conversationSection);
-  }
-  
-  // Add final instructions
-  sections.push('Generate your response as the assistant.');
-  sections.push('FINAL REMINDER: The first line of your response must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐" and your responses can only contain tool uses, no plain text messages');
-  
-  return sections.join('\n\n');
-}
-
-module.exports = {
-  allocatePromptBudget,
-  buildPromptFromAllocations,
-  scoreDiscoveries,
-  calculateImportanceWeight,
-  calculateRecencyFactor,
-  parseDiscovery,
-  BUDGET_LIMIT,
-  BUDGET_TARGET,
-  CATEGORY_CONFIGS
-};
