@@ -1570,13 +1570,13 @@ MODE: ${mode}
     }
     
     // Add recent conversation context (last 3 exchanges)
-    const lines = conversation.split('\n');
+    const conversationLines = conversation.split('\n');
     const exchanges = [];
     let currentExchange = [];
     let inAssistantBox = false;
     
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i];
+    for (let i = conversationLines.length - 1; i >= 0; i--) {
+      const line = conversationLines[i];
       
       if (line.startsWith('> ') && !inAssistantBox) {
         if (currentExchange.length > 0) {
@@ -1588,7 +1588,7 @@ MODE: ${mode}
       
       currentExchange.push(line);
       
-      if (line.includes('└─') && i > 0 && lines[i-1].includes('│')) {
+      if (line.includes('└─') && i > 0 && conversationLines[i-1].includes('│')) {
         inAssistantBox = true;
       } else if (line.includes('┌─ ASSISTANT')) {
         inAssistantBox = false;
