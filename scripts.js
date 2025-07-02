@@ -203,6 +203,8 @@ module.exports = { startWatching: startWatching };
 
 // ==========================================
 
+// process-response.js
+
 const fs = require('fs').promises;
 const path = require('path');
 const utils = require('./utils');
@@ -972,6 +974,8 @@ module.exports = { processResponse: processResponse };
 
 // ==========================================
 
+// message-to-prompt.js
+
 const fs = require('fs').promises;
 const utils = require('./utils');
 const { generatePrompt } = require('./prompt-generator');
@@ -1139,6 +1143,809 @@ async function buildPrompt() {
 module.exports = { buildPrompt: buildPrompt };
 
 // ==========================================
+
+// utils.js
+
+const fs = require('fs').promises;
+const path = require('path');
+
+// Configuration
+const CODEBASE_PATH = (function() {
+  let path = process.env.CODEBASE_PATH;
+  if (path) {
+    return path.trim(); // Remove any trailing spaces
+  }
+  
+  // Auto-detect: if we're in ai-work, use parent directory
+  if (__dirname.endsWith('ai-work')) {
+    return require('path').dirname(__dirname);
+  }
+  
+  return './test-project';
+})();
+
+async function ensureDir(dirPath) {
+  try {
+    await fs.mkdir(dirPath, { recursive: true });
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+}
+
+async function readFileIfExists(filePath) {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return '';
+    throw err;
+  }
+}
+
+function getActiveSelection(content) {
+  const lines = content.split('\n');
+  return lines
+    .filter(function(line) { return line.startsWith('x '); })
+    .map(function(line) { return line.slice(2).trim(); });
+}
+
+function getActiveMode(content) {
+  const lines = content.split('\n');
+  const activeLine = lines.find(function(line) { return line.startsWith('x '); });
+  return activeLine ? activeLine.slice(2).trim() : 'exploration';
+}
+
+function parseBlocks(text) {
+  const blocks = {};
+  const regex = /^(\w+): \[\[\[START\]\]\]\n(.*?)\n\[\[\[END\]\]\]/gms;
+  let match;
+  
+  while ((match = regex.exec(text)) !== null) {
+    const key = match[1];
+    const value = match[2];
+    blocks[key] = value.trim();
+  }
+  
+  return blocks;
+}
+
+function parseToolBlocks(text) {
+  const tools = [];
+  
+  // Remove the box wrapper if present
+  const boxMatch = text.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
+  let content = text;
+  
+  if (boxMatch) {
+    // Extract content and remove box borders from each line
+    const boxContent = boxMatch[1];
+    const lines = boxContent.split('\n');
+    const cleanedLines = [];
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Remove the leading "│ " and trailing " │" or "│"
+      const cleaned = line.replace(/^│\s?/, '').replace(/\s*│\s*$/, '');
+      if (cleaned.length > 0) {
+        cleanedLines.push(cleaned);
+      }
+    }
+    
+    // Join continuation lines (lines starting with "... ")
+    const joinedLines = [];
+    let currentLine = '';
+    
+    for (let i = 0; i < cleanedLines.length; i++) {
+      const line = cleanedLines[i];
+      if (line.startsWith('... ')) {
+        // Continuation line - append to current line
+        currentLine += line.slice(4); // Remove "... " prefix
+      } else {
+        // New line - save previous and start new
+        if (currentLine) {
+          joinedLines.push(currentLine);
+        }
+        currentLine = line;
+      }
+    }
+    if (currentLine) {
+      joinedLines.push(currentLine);
+    }
+    
+    content = joinedLines.join('\n');
+  }
+  
+  // Match tool patterns: [TOOLNAME] args on one line, then content until next tool or END tag
+  const lines = content.split('\n');
+  let i = 0;
+  
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    
+    // Check for tool start pattern
+    const toolMatch = line.match(/^\[([A-Z_]+)\](?:\s+(.*))?$/);
+    if (toolMatch) {
+      const toolName = toolMatch[1];
+      const args = toolMatch[2] || '';
+      
+      // Find where this tool ends (next tool, END tag, or end of content)
+      let endIndex = lines.length;
+      let hasEndTag = false;
+      
+      for (let j = i + 1; j < lines.length; j++) {
+        const checkLine = lines[j].trim();
+        // Check for END tag
+        if (checkLine === '[END_' + toolName + ']') {
+          endIndex = j;
+          hasEndTag = true;
+          break;
+        }
+        // Check for next tool
+        if (checkLine.match(/^\[([A-Z_]+)\]/)) {
+          endIndex = j;
+          break;
+        }
+      }
+      
+      // Extract content lines
+      const contentLines = lines.slice(i + 1, endIndex);
+      const content = contentLines.join('\n').trim();
+      
+      // Parse based on tool type
+      const params = parseToolParams(toolName, args, content);
+      
+      tools.push({
+        name: toolName,
+        params: params,
+        startIndex: 0, // We'll update this if needed
+        endIndex: 0
+      });
+      
+      // Move past this tool (and END tag if present)
+      i = hasEndTag ? endIndex + 1 : endIndex;
+    } else {
+      i++;
+    }
+  }
+  
+  return tools;
+}
+
+function parseToolParams(toolName, args, content) {
+  const params = {};
+  
+  switch (toolName) {
+    case 'LIST':
+      params.path = args || '.';
+      params.explanation = content;
+      break;
+      
+    case 'READ':
+      params.file_name = args;
+      params.explanation = content;
+      break;
+      
+    case 'SEARCH_NAME':
+      const nameArgs = args.split(/\s+/);
+      params.regex = nameArgs[0];
+      params.folder = nameArgs[1] || '.';
+      params.explanation = content;
+      break;
+      
+    case 'SEARCH_CONTENT':
+      const contentArgs = args.split(/\s+/);
+      params.regex = contentArgs[0];
+      params.folder = contentArgs[1] || '.';
+      params.explanation = content;
+      break;
+      
+    case 'MESSAGE':
+      // For MESSAGE, all content is the message
+      params.content = content;
+      break;
+      
+    case 'CREATE':
+      params.path = args;
+      // Check if first line is a description comment
+      const createLines = content.split('\n');
+      if (createLines[0] && createLines[0].startsWith('# ')) {
+        params.description = createLines[0].slice(2);
+        params.contents = createLines.slice(1).join('\n');
+      } else {
+        params.contents = content;
+      }
+      break;
+      
+    case 'UPDATE':
+      const updateArgs = args.split(/\s+/);
+      params.file_name = updateArgs[0];
+      params.start_line = updateArgs[1];
+      params.end_line = updateArgs[2];
+      // First line should be # description
+      const updateLines = content.split('\n');
+      if (updateLines[0] && updateLines[0].startsWith('# ')) {
+        params.change_description = updateLines[0].slice(2);
+        params.contents = updateLines.slice(1).join('\n');
+      } else {
+        // Fallback if no # description
+        params.change_description = 'File update';
+        params.contents = content;
+      }
+      break;
+      
+    case 'INSERT':
+      const insertArgs = args.split(/\s+/);
+      params.file_name = insertArgs[0];
+      params.line_number = insertArgs[1];
+      // First line should be # description
+      const insertLines = content.split('\n');
+      if (insertLines[0] && insertLines[0].startsWith('# ')) {
+        params.change_description = insertLines[0].slice(2);
+        params.contents = insertLines.slice(1).join('\n');
+      } else {
+        // Fallback if no # description
+        params.change_description = 'Line insertion';
+        params.contents = content;
+      }
+      break;
+      
+    case 'DELETE':
+      params.file_name = args;
+      params.explanation = content;
+      break;
+      
+    case 'DISCOVERED':
+      params.importance = parseInt(args) || 5;
+      params.content = content;
+      break;
+      
+    case 'SWITCH_TO':
+      params.mode = args;
+      break;
+      
+    case 'SWITCH_TO_EXPLORATION':
+      params.mode = 'exploration';
+      break;
+      
+    case 'SWITCH_TO_PLANNING':
+      params.mode = 'planning';
+      break;
+      
+    case 'SWITCH_TO_IMPLEMENTATION':
+      params.mode = 'implementation';
+      break;
+      
+    case 'EXPLORATION_FINDINGS':
+      params.name = args;
+      params.content = content;
+      break;
+      
+    case 'DETAILED_PLAN':
+      params.name = args;
+      params.content = content;
+      break;
+      
+    case 'COMMIT':
+      // No params needed
+      break;
+  }
+  
+  return params;
+}
+
+function classifyTools(tools) {
+  const informationTools = ['LIST', 'READ', 'SEARCH_NAME', 'SEARCH_CONTENT'];
+  const responseTools = ['MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
+                        'CREATE', 'UPDATE', 'INSERT', 'DELETE',
+                        'SWITCH_TO', 'SWITCH_TO_EXPLORATION', 'SWITCH_TO_PLANNING', 
+                        'SWITCH_TO_IMPLEMENTATION', 'COMMIT'];
+  
+  const hasInfoTools = tools.some(t => informationTools.includes(t.name));
+  const hasResponseTools = tools.some(t => responseTools.includes(t.name));
+  
+  if (hasInfoTools && hasResponseTools) {
+    return { 
+      type: 'mixed', 
+      error: 'Cannot mix READ tools with WRITE tools in the same response'
+    };
+  }
+  
+  if (hasInfoTools) return { type: 'read' };
+  if (hasResponseTools) return { type: 'write' };
+  return { type: 'empty' };
+}
+
+function validateResponseType(text, tools) {
+  const classification = classifyTools(tools);
+  
+  // Check if message has the required box format
+  const hasBox = text.includes('┌─ ASSISTANT') && text.includes('└─');
+  if (!hasBox) {
+    return {
+      valid: false,
+      error: 'Response must be wrapped in ASCII box starting with ┌─ ASSISTANT ─┐'
+    };
+  }
+  
+  switch (classification.type) {
+    case 'mixed':
+      return { 
+        valid: false, 
+        error: classification.error 
+      };
+      
+    case 'read':
+      return { valid: true, type: 'read' };
+      
+    case 'write':
+      return { valid: true, type: 'write' };
+      
+    case 'empty':
+      return { 
+        valid: false, 
+        error: 'Response must contain at least one tool' 
+      };
+  }
+}
+
+function replaceToolsWithIndicators(text, tools) {
+  // For assistant messages, preserve the original box format as-is
+  return text.trim();
+}
+
+function hasBoxClosure(text) {
+  return /└─+┘/.test(text);
+}
+
+function validateMessageFormat(text) {
+  if (!text.includes('┌─ ASSISTANT') || !hasBoxClosure(text)) {
+    throw new Error('Invalid format: Response must be wrapped in complete ASCII box');
+  }
+  
+  return true;
+}
+
+async function searchFilesByName(folder, regex) {
+  const pattern = new RegExp(regex, 'i');
+  const results = [];
+  
+  async function searchDir(dir) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const fullPath = path.join(dir, entry.name);
+        
+        if (entry.isDirectory()) {
+          await searchDir(fullPath);
+        } else if (pattern.test(entry.name)) {
+          results.push(fullPath);
+        }
+      }
+    } catch (err) {
+      // Skip inaccessible directories
+    }
+  }
+  
+  await searchDir(folder);
+  return results;
+}
+
+async function searchFilesByContent(folder, regex) {
+  const pattern = new RegExp(regex, 'gm');
+  const results = [];
+  
+  async function searchDir(dir) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const fullPath = path.join(dir, entry.name);
+        
+        if (entry.isDirectory()) {
+          await searchDir(fullPath);
+        } else {
+          try {
+            const content = await fs.readFile(fullPath, 'utf8');
+            const lines = content.split('\n');
+            const matches = [];
+            
+            for (let j = 0; j < lines.length; j++) {
+              const line = lines[j];
+              const index = j;
+              if (pattern.test(line)) {
+                const start = Math.max(0, index - 10);
+                const end = Math.min(lines.length - 1, index + 10);
+                matches.push({ lineNum: index + 1, start: start, end: end });
+              }
+            }
+            
+            if (matches.length > 0) {
+              const merged = [];
+              for (let k = 0; k < matches.length; k++) {
+                const match = matches[k];
+                const existing = merged.find(function(m) {
+                  return (match.start <= m.end && match.end >= m.start);
+                });
+                if (existing) {
+                  existing.start = Math.min(existing.start, match.start);
+                  existing.end = Math.max(existing.end, match.end);
+                } else {
+                  merged.push(match);
+                }
+              }
+              
+              for (let l = 0; l < merged.length; l++) {
+                const section = merged[l];
+                const sectionLines = lines.slice(section.start, section.end + 1);
+                const numberedLines = [];
+                for (let m = 0; m < sectionLines.length; m++) {
+                  const line = sectionLines[m];
+                  const lineNum = section.start + m + 1;
+                  const isMatch = pattern.test(line);
+                  numberedLines.push(lineNum + ': ' + line + (isMatch ? ' // <-- MATCH' : ''));
+                }
+                
+                results.push({
+                  file: fullPath,
+                  lines: (section.start + 1) + '-' + (section.end + 1),
+                  content: numberedLines.join('\n')
+                });
+              }
+            }
+          } catch (err) {
+            // Skip non-text files
+          }
+        }
+      }
+    } catch (err) {
+      // Skip inaccessible directories
+    }
+  }
+  
+  await searchDir(folder);
+  return results;
+}
+
+function calculateImportanceWeight(importance) {
+  return Math.pow(2.5, importance - 1);
+}
+
+function compactDiscoveries(discoveries, maxCount) {
+  if (maxCount === undefined) maxCount = 50;
+  
+  const lines = discoveries.split('\n').filter(function(line) { return line.trim(); });
+  if (lines.length <= maxCount) return discoveries;
+  
+  const parsed = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const match = line.match(/^\[([^\]]+)\] importance:(\d+) (.+)$/);
+    if (match) {
+      parsed.push({
+        date: new Date(match[1]),
+        importance: parseInt(match[2]),
+        content: match[3],
+        weight: calculateImportanceWeight(parseInt(match[2]))
+      });
+    }
+  }
+  
+  parsed.sort(function(a, b) {
+    if (a.importance === 10 && b.importance !== 10) return -1;
+    if (b.importance === 10 && a.importance !== 10) return 1;
+    
+    const weightDiff = b.weight - a.weight;
+    if (Math.abs(weightDiff) > 0.1) return weightDiff;
+    
+    return b.date - a.date;
+  });
+  
+  const kept = parsed.slice(0, maxCount);
+  const result = [];
+  for (let i = 0; i < kept.length; i++) {
+    const item = kept[i];
+    result.push('[' + item.date.toISOString().split('T')[0] + '] importance:' + item.importance + ' ' + item.content);
+  }
+  return result.join('\n');
+}
+
+function compactConversation(conversationHistory, maxLength) {
+  if (maxLength === undefined) maxLength = 50000; // Default max length for conversation
+  
+  if (conversationHistory.length <= maxLength) {
+    return conversationHistory;
+  }
+  
+  const lines = conversationHistory.split('\n').filter(function(line) { return line.trim(); });
+  
+  // Find conversation exchanges (> for user, ┌─ ASSISTANT for assistant)
+  const exchanges = [];
+  let currentExchange = { user: '', assistant: '', other: [] };
+  let inAssistantBox = false;
+  let assistantLines = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    if (line.startsWith('> ')) {
+      // Start new exchange
+      if (currentExchange.user || currentExchange.assistant.length > 0) {
+        exchanges.push(currentExchange);
+      }
+      currentExchange = { user: line, assistant: '', other: [] };
+    } else if (line.includes('┌─ ASSISTANT')) {
+      inAssistantBox = true;
+      assistantLines = [line];
+    } else if (inAssistantBox) {
+      assistantLines.push(line);
+      if (line.includes('└─')) {
+        inAssistantBox = false;
+        currentExchange.assistant = assistantLines.join('\n');
+        assistantLines = [];
+      }
+    } else if (line.startsWith('SYSTEM:')) {
+      currentExchange.other.push(line);
+    }
+  }
+  
+  // Add the last exchange
+  if (currentExchange.user || currentExchange.assistant.length > 0) {
+    exchanges.push(currentExchange);
+  }
+  
+  if (exchanges.length <= 3) {
+    return conversationHistory; // Don't compact if very short
+  }
+  
+  // Keep recent exchanges (last 3) and summarize older ones
+  const recentExchanges = exchanges.slice(-3);
+  const oldExchanges = exchanges.slice(0, -3);
+  
+  // Create summary of old exchanges
+  const importantPoints = [];
+  const decisions = [];
+  const discoveries = [];
+  
+  for (let i = 0; i < oldExchanges.length; i++) {
+    const exchange = oldExchanges[i];
+    const userText = exchange.user;
+    const assistantText = exchange.assistant;
+    
+    // Extract important information
+    if (userText.includes('implement') || userText.includes('create') || userText.includes('build')) {
+      decisions.push('User requested: ' + userText.replace('> ', ''));
+    }
+    
+    if (assistantText.includes('[SWITCH_TO]')) {
+      const modeMatch = assistantText.match(/\[SWITCH_TO\]\s+(\w+)/);
+      if (modeMatch) {
+        decisions.push('Mode change to ' + modeMatch[1]);
+      }
+    }
+    
+    // Look for discoveries in assistant text
+    if (assistantText.includes('[DISCOVERED]')) {
+      const discoveryMatch = assistantText.match(/\[DISCOVERED\]\s+(\d+)\s+([^\n]+)/);
+      if (discoveryMatch) {
+        discoveries.push('Discovery (importance ' + discoveryMatch[1] + '): ' + discoveryMatch[2]);
+      }
+    }
+    
+    // Look for key decisions in tool results
+    for (let j = 0; j < exchange.other.length; j++) {
+      const otherLine = exchange.other[j];
+      if (otherLine.includes('Discovery') && otherLine.includes('importance')) {
+        discoveries.push(otherLine);
+      }
+      if (otherLine.includes('committed') || otherLine.includes('created')) {
+        decisions.push(otherLine);
+      }
+    }
+  }
+  
+  // Build compact summary
+  let summary = '=== CONVERSATION SUMMARY ===\n';
+  
+  if (decisions.length > 0) {
+    summary += 'KEY DECISIONS:\n';
+    for (let i = 0; i < Math.min(decisions.length, 5); i++) {
+      summary += '- ' + decisions[i] + '\n';
+    }
+    summary += '\n';
+  }
+  
+  if (discoveries.length > 0) {
+    summary += 'KEY DISCOVERIES:\n';
+    for (let i = 0; i < Math.min(discoveries.length, 3); i++) {
+      summary += '- ' + discoveries[i] + '\n';
+    }
+    summary += '\n';
+  }
+  
+  summary += '=== RECENT CONVERSATION ===\n';
+  
+  // Add recent exchanges
+  for (let i = 0; i < recentExchanges.length; i++) {
+    const exchange = recentExchanges[i];
+    if (exchange.user) summary += exchange.user + '\n';
+    if (exchange.assistant) summary += exchange.assistant + '\n';
+    for (let j = 0; j < exchange.other.length; j++) {
+      summary += exchange.other[j] + '\n';
+    }
+  }
+  
+  return summary;
+}
+
+function calculatePromptLength(basePrompt, modePrompt, goals, context, conversationHistory) {
+  return (basePrompt + modePrompt + goals + context + conversationHistory).length;
+}
+
+async function getLineCount(filePath) {
+  try {
+    const content = await fs.readFile(filePath, 'utf8');
+    return content.split('\n').length;
+  } catch (err) {
+    return 0;
+  }
+}
+
+async function countFilesInDir(dirPath) {
+  let count = 0;
+  
+  async function countDir(dir) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.name.startsWith('.')) continue;
+        
+        if (entry.isFile()) {
+          count++;
+        } else if (entry.isDirectory()) {
+          await countDir(path.join(dir, entry.name));
+        }
+      }
+    } catch (err) {
+      // Skip inaccessible directories
+    }
+  }
+  
+  await countDir(dirPath);
+  return count;
+}
+
+function getCodebasePath(relativePath) {
+  if (relativePath === undefined) relativePath = '';
+  return path.join(CODEBASE_PATH, relativePath);
+}
+
+function wrapText(text, maxWidth) {
+  if (!maxWidth) maxWidth = 70;
+  const words = text.split(' ');
+  const lines = [];
+  let currentLine = '';
+  
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (currentLine.length + word.length + 1 > maxWidth) {
+      lines.push(currentLine);
+      currentLine = '... ' + word;
+    } else {
+      currentLine += (currentLine ? ' ' : '') + word;
+    }
+  }
+  
+  if (currentLine) lines.push(currentLine);
+  return lines;
+}
+
+function formatInBox(content, width) {
+  if (!width) width = 70;
+  const lines = content.split('\n');
+  const wrappedLines = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.length <= width - 4) { // Account for box borders
+      wrappedLines.push(line);
+    } else {
+      // Wrap long lines
+      const wrapped = wrapText(line, width - 4);
+      wrappedLines.push(...wrapped);
+    }
+  }
+  
+  // Build box
+  let result = '┌─ ASSISTANT ';
+  result += '─'.repeat(width - result.length - 1) + '┐\n';
+  
+  for (let i = 0; i < wrappedLines.length; i++) {
+    const line = wrappedLines[i];
+    result += '│ ' + line + ' '.repeat(width - line.length - 4) + ' │\n';
+  }
+  
+  result += '└' + '─'.repeat(width - 2) + '┘';
+  return result;
+}
+
+function wrapSystemMessage(content) {
+  const lines = content.split('\n');
+  const wrapped = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.length <= 70) {
+      wrapped.push(line);
+    } else {
+      const wrappedLine = wrapText(line, 70);
+      wrapped.push(...wrappedLine);
+    }
+  }
+  
+  return wrapped.join('\n');
+}
+
+function fixBoxPadding(text) {
+  const lines = text.split('\n');
+  const fixedLines = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    if (line.includes('┌─ ASSISTANT')) {
+      // Top border - ensure it's exactly 70 chars
+      const prefix = '┌─ ASSISTANT ';
+      fixedLines.push(prefix + '─'.repeat(70 - prefix.length - 1) + '┐');
+    } else if (line.includes('└─')) {
+      // Bottom border
+      fixedLines.push('└' + '─'.repeat(68) + '┘');
+    } else if (line.startsWith('│')) {
+      // Content line - ensure proper padding (66 chars for content + 4 for borders = 70)
+      const content = line.substring(1).replace(/\s*│\s*$/, '');
+      const paddedContent = content + ' '.repeat(Math.max(0, 66 - content.length));
+      fixedLines.push('│ ' + paddedContent + ' │');
+    } else {
+      fixedLines.push(line);
+    }
+  }
+  
+  return fixedLines.join('\n');
+}
+
+module.exports = {
+  CODEBASE_PATH: CODEBASE_PATH,
+  ensureDir: ensureDir,
+  readFileIfExists: readFileIfExists,
+  getActiveSelection: getActiveSelection,
+  getActiveMode: getActiveMode,
+  parseToolBlocks: parseToolBlocks,
+  classifyTools: classifyTools,
+  validateResponseType: validateResponseType,
+  replaceToolsWithIndicators: replaceToolsWithIndicators,
+  validateMessageFormat: validateMessageFormat,
+  hasBoxClosure: hasBoxClosure,
+  searchFilesByName: searchFilesByName,
+  searchFilesByContent: searchFilesByContent,
+  calculateImportanceWeight: calculateImportanceWeight,
+  compactDiscoveries: compactDiscoveries,
+  compactConversation: compactConversation,
+  calculatePromptLength: calculatePromptLength,
+  getLineCount: getLineCount,
+  countFilesInDir: countFilesInDir,
+  getCodebasePath: getCodebasePath,
+  wrapText: wrapText,
+  formatInBox: formatInBox,
+  wrapSystemMessage: wrapSystemMessage,
+  fixBoxPadding: fixBoxPadding
+};
+
+// ==========================================
+
+// prompt-generator.js
 
 const utils = require('./utils');
 
