@@ -297,39 +297,10 @@ async function handleFatalError(message) {
 
 async function handleExtractionResponse(responseText, tempBlock) {
   try {
-    // Validate the extraction response
-    utils.validateMessageFormat(responseText);
+    // For extraction, we accept plain text - no validation needed
+    let extractedContent = responseText.trim();
     
-    // Parse tools (should only be MESSAGE)
-    const tools = utils.parseToolBlocks(responseText);
-    
-    // Check that only MESSAGE tool is used
-    const nonMessageTools = tools.filter(t => t.name !== 'MESSAGE');
-    if (nonMessageTools.length > 0) {
-      console.error('❌ Extraction response can only use [MESSAGE] tool');
-      await handleResponseTypeError('Extraction response can only use [MESSAGE] tool', responseText);
-      return;
-    }
-    
-    // Get the extraction content
-    const messageTools = tools.filter(t => t.name === 'MESSAGE');
-    let extractedContent = '';
-    
-    if (messageTools.length > 0) {
-      extractedContent = messageTools.map(t => t.params.content).join('\n\n');
-    } else {
-      // No MESSAGE tool, try to extract from the box content
-      const boxMatch = responseText.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
-      if (boxMatch) {
-        const lines = boxMatch[1].split('\n');
-        extractedContent = lines
-          .map(line => line.replace(/^│\s?/, '').replace(/\s*│\s*$/, ''))
-          .filter(line => line.length > 0)
-          .join('\n');
-      }
-    }
-    
-    if (!extractedContent.trim()) {
+    if (!extractedContent) {
       extractedContent = '[No relevant information found]';
     }
     
@@ -403,34 +374,42 @@ async function handleReadResponse(responseText, tools) {
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   await updateConversation(cleanResponse);
   
-  // Process each read tool using two-stage approach
+  let hasTemporaryBlocks = false;
+  
+  // Process all read tools and create temporary blocks for each
   for (let i = 0; i < tools.length; i++) {
     const tool = tools[i];
     
-    if (tool.name === 'READ' || tool.name === 'SEARCH_CONTENT') {
-      // Execute the tool
-      const result = await executeTool(tool);
+    if (tool.name === 'READ_CODE' || tool.name === 'READ_REQUIREMENTS' || tool.name === 'SEARCH_CONTENT') {
+      // Execute the tool to get the result
+      const rawResult = await executeTool(tool);
       
-      if (typeof result === 'string' && result.startsWith('Error:')) {
+      if (typeof rawResult === 'string' && rawResult.startsWith('Error:')) {
         // Error occurred, add to conversation normally
-        await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + result);
+        await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + rawResult);
       } else {
-        // Add temporary block with full content
-        const tempTitle = tool.name === 'READ' 
-          ? 'Content of ' + (tool.params.file_name || tool.params.path || '.')
-          : 'Search results for "' + tool.params.regex + '"';
+        // For READ tools, we need to extract just the content without the prefix
+        let content = rawResult;
+        let title = '';
         
-        const tempBlock = utils.formatTemporaryBlock(tempTitle, result);
+        if (tool.name === 'READ_CODE' || tool.name === 'READ_REQUIREMENTS') {
+          // Remove the "Content of filename:" prefix if present
+          const lines = rawResult.split('\n');
+          if (lines[0].startsWith('Content of ') || lines[0].startsWith('Contents of ')) {
+            title = lines[0].replace('Content of ', '').replace('Contents of ', '').replace(':', '').trim();
+            content = lines.slice(1).join('\n');
+          } else {
+            // Fallback title
+            title = (tool.params.file_name || tool.params.path || '.');
+          }
+        } else if (tool.name === 'SEARCH_CONTENT') {
+          title = 'Search results for "' + tool.params.regex + '"';
+        }
+        
+        // Add temporary block with the content
+        const tempBlock = utils.formatTemporaryBlock(title, content);
         await updateConversation(tempBlock);
-        
-        // Clear response and build extraction prompt
-        await fs.writeFile('ai-response.md', '', 'utf8');
-        const buildPrompt = require('./message-to-prompt').buildPrompt;
-        await buildPrompt();
-        console.log('✓ Temporary content added, extraction prompt ready');
-        
-        // Stop processing further tools - one at a time
-        return;
+        hasTemporaryBlocks = true;
       }
     } else {
       // Other read tools (SEARCH_NAME) process normally
@@ -439,11 +418,16 @@ async function handleReadResponse(responseText, tools) {
     }
   }
   
-  // All tools processed, clear response and build next prompt
+  // Clear response and build next prompt
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
-  console.log('✓ Read operations complete, next prompt ready');
+  
+  if (hasTemporaryBlocks) {
+    console.log('✓ Temporary content blocks added, extraction prompt ready');
+  } else {
+    console.log('✓ Read operations complete, next prompt ready');
+  }
 }
 
 async function handleWriteResponse(responseText, tools) {
@@ -612,7 +596,8 @@ async function updateMode(newMode) {
 
 async function executeTool(tool) {
   switch (tool.name) {
-    case 'READ':
+    case 'READ_CODE':
+    case 'READ_REQUIREMENTS':
       return await executeRead(tool.params);
     case 'SEARCH_NAME':
       return await executeSearchFilesByName(tool.params);
@@ -1395,7 +1380,7 @@ async function buildPrompt(extractionMode = false) {
     
     // Generate 2-level directory listing
     const readTool = {
-      name: 'READ',
+      name: 'READ_CODE',
       params: { path: '.', maxDepth: 2 }
     };
     const projectStructure = await executeTwoLevelList(readTool.params);
@@ -1477,8 +1462,18 @@ async function buildExtractionPrompt(tempBlock) {
     
     // Determine the type of content from the title
     const isDirectory = tempBlock.title.includes('Contents of ');
-    const isSearchResult = tempBlock.title.includes('Content matches') || tempBlock.title.includes('Files found');
-    const isFileContent = tempBlock.title.includes('Content of ');
+    const isSearchResult = tempBlock.title.includes('Content matches') || tempBlock.title.includes('Files found') || tempBlock.title.includes('Search results');
+    const isFileContent = tempBlock.title.includes('Content of ') && !isDirectory;
+    
+    // Try to determine if it's code or requirements based on file extension
+    let isCode = true; // Default to code
+    if (isFileContent) {
+      const docExtensions = ['.md', '.txt', '.rst', '.doc', '.docx', '.pdf'];
+      const hasDocExtension = docExtensions.some(ext => tempBlock.title.toLowerCase().includes(ext));
+      if (hasDocExtension) {
+        isCode = false;
+      }
+    }
     
     // Get current context
     const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
@@ -1498,7 +1493,7 @@ You are reviewing data from a ${isDirectory ? 'directory listing' : isFileConten
 2) Think of this as asking yourself a question about the data and writing your response
 3) Be thorough but concise - extract the most important information rather than copying large sections verbatim
 4) You won't see this data again, so capture everything you might need
-5) Write your extraction in the standard ASCII box format
+5) Just write your extraction as plain text - no formatting or tools needed
 
 ## Current Context
 
@@ -1564,7 +1559,9 @@ config/database.json
 `;
     } else if (isFileContent) {
       const fileName = tempBlock.title.replace('Content of ', '').replace('TEMPORARY: ', '').trim();
-      prompt += `## Code/Document Extraction Guidelines
+      
+      if (isCode) {
+        prompt += `## Code Extraction Guidelines
 
 From ${fileName}, extract information relevant to your current task:
 - Key functions/classes and their purposes
@@ -1573,13 +1570,37 @@ From ${fileName}, extract information relevant to your current task:
 - Configuration values
 - Security concerns or potential issues
 - TODO/FIXME comments
+- Error handling patterns
+- API endpoints or routes
+- Database queries or schema references
 - Relevant code sections with line numbers
 - Any patterns or architectural decisions
 
-Remember: You're analyzing this to answer questions about the codebase. Extract insights, not just raw code.
+Remember: You're analyzing code to understand how things work. Extract insights about functionality, not just raw code.
 Include line number references where important (e.g., "Line 45-67: Authentication logic uses bcrypt").
 
 `;
+      } else {
+        prompt += `## Requirements/Documentation Extraction Guidelines
+
+From ${fileName}, extract information relevant to your current task:
+- Key requirements and constraints
+- User stories or use cases
+- Acceptance criteria
+- Business rules and logic
+- Technical specifications
+- Design decisions and rationale
+- Dependencies or prerequisites
+- Open questions or ambiguities
+- Success metrics or KPIs
+- Timeline or milestone information
+- Stakeholder concerns
+
+Remember: You're analyzing requirements to understand what needs to be built. Focus on the "what" and "why".
+Include section references where helpful (e.g., "Section 3.2: Authentication must support OAuth2").
+
+`;
+      }
     } else if (isSearchResult) {
       prompt += `## Search Result Extraction Guidelines
 
@@ -1599,18 +1620,9 @@ Focus on insights and patterns rather than listing every match.
     prompt += '## Data to Review\n\n' + tempBlock.content + '\n\n';
     
     // Add final instructions
-    prompt += `## Response Format
+    prompt += `## Your Task
 
-Wrap your extraction in the standard ASCII box format:
-
-\`\`\`
-┌─ ASSISTANT ─────────────────────────────────────────────────────────┐
-│ [MESSAGE]                                                           │
-│ Your extracted information here...                                  │
-└─────────────────────────────────────────────────────────────────────┘
-\`\`\`
-
-Extract the relevant information now.`;
+Extract the relevant information now. Write your analysis as plain text.`;
     
     await fs.writeFile('generated-prompt.md', prompt, 'utf8');
     console.log('✓ Extraction prompt ready in generated-prompt.md');
@@ -1623,8 +1635,6 @@ Extract the relevant information now.`;
 module.exports = { buildPrompt: buildPrompt };
 
 // ==========================================
-
-// utils.js
 
 // utils.js
 
@@ -1839,7 +1849,8 @@ function parseToolParams(toolName, args, content) {
   }
   
   switch (toolName) {
-    case 'READ':
+    case 'READ_CODE':
+    case 'READ_REQUIREMENTS':
       params.file_name = args || '.';  // Default to current directory
       params.path = args || '.';  // Support both for compatibility
       params.explanation = content;
@@ -1954,7 +1965,7 @@ function parseToolParams(toolName, args, content) {
 }
 
 function classifyTools(tools) {
-  const informationTools = ['READ', 'SEARCH_NAME', 'SEARCH_CONTENT'];
+  const informationTools = ['READ_CODE', 'READ_REQUIREMENTS', 'SEARCH_NAME', 'SEARCH_CONTENT'];
   const responseTools = ['MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
                         'CREATE', 'UPDATE', 'INSERT', 'DELETE',
                         'SWITCH_TO', 'SWITCH_TO_EXPLORATION', 'SWITCH_TO_PLANNING', 
@@ -2616,7 +2627,8 @@ Complete these tasks:
 #1 Decide if you need to READ or WRITE to complete the next assistant message, then choose the corresponding response type.
 
 Tools allowed in the READ response type:
-- [READ]
+- [READ_CODE]
+- [READ_REQUIREMENTS]
 - [SEARCH_NAME]
 - [SEARCH_CONTENT]
 
@@ -2630,7 +2642,8 @@ const MODE_CONFIGS = {
 
 Your job is to understand the codebase and requirements:
 
-- Use READ to explore project structure and examine files
+- Use READ_CODE to explore source files and examine implementation
+- Use READ_REQUIREMENTS to review documentation and specifications  
 - Use SEARCH_NAME and SEARCH_CONTENT to discover patterns
 - Use MESSAGE to ask clarifying questions or provide updates
 - Document findings with DISCOVERED blocks (importance 1-10)
@@ -2682,26 +2695,44 @@ Remember: NO plain text allowed. Use [MESSAGE] for all communication.`
 // Tool documentation
 const TOOL_DOCS = {
   // READ tools (always available)
-  READ: `**[READ] path**
-Read file contents or list directory contents. Path defaults to current directory (.).
+  READ_CODE: `**[READ_CODE] path**
+Read source code files or list directory contents. Path defaults to current directory (.).
 For files: shows content with line numbers. For directories: shows file tree.
-You can use multiple READ commands in one response to examine multiple items efficiently.
+Use for: source files (.js, .py, .java, etc), config files, scripts, any code-related files.
 NOTE: You can only read text files. Binary files (jar, zip, exe, images, etc.) are not allowed.
 \`\`\`
-[READ] .
+[READ_CODE] .
 List current directory contents
 
-[READ] src/
+[READ_CODE] src/
 List src directory contents
 
-[READ] package.json
+[READ_CODE] package.json
 Read package.json file
 
-[READ] src/index.js
+[READ_CODE] src/index.js
 Read the main entry point
 
-[READ] src/config.js
-Reviewing configuration
+[READ_CODE] src/auth/login.js
+Examining authentication logic
+\`\`\``,
+
+  READ_REQUIREMENTS: `**[READ_REQUIREMENTS] path**
+Read requirements, documentation, specs, or any non-code text files.
+Shows content with line numbers for detailed reference.
+Use for: .md files, .txt files, documentation, specifications, requirements, user stories.
+\`\`\`
+[READ_REQUIREMENTS] README.md
+Understanding project overview
+
+[READ_REQUIREMENTS] docs/api-spec.md
+Reviewing API specifications
+
+[READ_REQUIREMENTS] requirements/auth-flow.txt
+Reading authentication requirements
+
+[READ_REQUIREMENTS] CHANGELOG.md
+Checking recent changes
 \`\`\``,
 
   SEARCH_NAME: `**[SEARCH_NAME] pattern folder**
@@ -2904,7 +2935,7 @@ Found Express.js authentication setup with session management
 - **Always include [MESSAGE]**: In WRITE responses, start with [MESSAGE] for any text
 - **Use positional parameters**: Tools now use positions, not named parameters
 - **Smart termination**: Tools end at next tool line or box closure
-- **Progressive discovery**: Start with [READ] . at root, explore as needed
+- **Progressive discovery**: Start with [READ_CODE] . at root, explore as needed
 - **One file operation at a time**: For [UPDATE] and [INSERT] operations
 - **Document importance**: Rate [DISCOVERED] items 1-10
 - **# Description pattern**: Use # for descriptions in [CREATE], [UPDATE], [INSERT]
@@ -2947,7 +2978,7 @@ function generatePrompt(options) {
   let toolDocs = '\n\n#2 Generate your response inside the ASCII box using ONLY tools from your chosen type.\n\n## TOOL FORMATS (POSITIONAL PARAMETERS)\n\n### READ Tools (Information Gathering)\n\n';
   
   // Add READ tool docs (always available)
-  toolDocs += [TOOL_DOCS.READ, TOOL_DOCS.SEARCH_NAME, TOOL_DOCS.SEARCH_CONTENT].join('\n\n');
+  toolDocs += [TOOL_DOCS.READ_CODE, TOOL_DOCS.READ_REQUIREMENTS, TOOL_DOCS.SEARCH_NAME, TOOL_DOCS.SEARCH_CONTENT].join('\n\n');
   
   // Add WRITE tool docs (mode-specific)
   toolDocs += '\n\n### WRITE Tools (Response and Actions)\n\n';
@@ -3001,6 +3032,8 @@ function generatePrompt(options) {
 module.exports = { generatePrompt };
 
 // ==========================================
+
+// prompt-budget-allocator.js
 
 // prompt-budget-allocator.js
 
