@@ -350,9 +350,9 @@ async function handleResponseTypeError(errorMessage, responseText) {
   
   const errorResponse = 'SYSTEM: ERROR - ' + errorMessage + '\n\n' +
     'Response Rules:\n' +
-    '1. READ Response: Use ONLY [READ], [SEARCH_NAME], [SEARCH_CONTENT]\n' +
+    '1. READ Response: Use ONLY [READ_CODE], [READ_REQUIREMENTS], [SEARCH_NAME], [SEARCH_CONTENT]\n' +
     '2. WRITE Response: Use [MESSAGE] for text and/or action tools\n' +
-    '3. Wrap response in ┌─ ASSISTANT ─┐ box\n\n' +
+    '3. Wrap response in ┌─ ASSISTANT ─ box\n\n' +
     (responseText.includes('┌─ ASSISTANT') ? 
       'Your last response violated these rules. Please try again.' :
       'Your response was missing the required ASCII box format. Here\'s what you wrote:\n\n' +
@@ -374,13 +374,14 @@ async function handleReadResponse(responseText, tools) {
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   await updateConversation(cleanResponse);
   
-  let hasTemporaryBlocks = false;
+  const temporaryBlocks = [];
+  const SEARCH_BLOCK_SIZE = 30000; // 30K characters per block
   
-  // Process all read tools and create temporary blocks for each
+  // Process all read tools and prepare temporary blocks
   for (let i = 0; i < tools.length; i++) {
     const tool = tools[i];
     
-    if (tool.name === 'READ_CODE' || tool.name === 'READ_REQUIREMENTS' || tool.name === 'SEARCH_CONTENT') {
+    if (tool.name === 'READ_CODE' || tool.name === 'READ_REQUIREMENTS') {
       // Execute the tool to get the result
       const rawResult = await executeTool(tool);
       
@@ -388,33 +389,91 @@ async function handleReadResponse(responseText, tools) {
         // Error occurred, add to conversation normally
         await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + rawResult);
       } else {
-        // For READ tools, we need to extract just the content without the prefix
+        // Extract just the content without the prefix
         let content = rawResult;
         let title = '';
         
-        if (tool.name === 'READ_CODE' || tool.name === 'READ_REQUIREMENTS') {
-          // Remove the "Content of filename:" prefix if present
-          const lines = rawResult.split('\n');
-          if (lines[0].startsWith('Content of ') || lines[0].startsWith('Contents of ')) {
-            title = lines[0].replace('Content of ', '').replace('Contents of ', '').replace(':', '').trim();
-            content = lines.slice(1).join('\n');
-          } else {
-            // Fallback title
-            title = (tool.params.file_name || tool.params.path || '.');
-          }
-        } else if (tool.name === 'SEARCH_CONTENT') {
-          title = 'Search results for "' + tool.params.regex + '"';
+        const lines = rawResult.split('\n');
+        if (lines[0].startsWith('Content of ') || lines[0].startsWith('Contents of ')) {
+          title = lines[0].replace('Content of ', '').replace('Contents of ', '').replace(':', '').trim();
+          content = lines.slice(1).join('\n');
+        } else {
+          title = (tool.params.file_name || tool.params.path || '.');
         }
         
-        // Add temporary block with the content
-        const tempBlock = utils.formatTemporaryBlock(title, content);
-        await updateConversation(tempBlock);
-        hasTemporaryBlocks = true;
+        // Add to temporary blocks list (one per file)
+        temporaryBlocks.push({ title, content });
       }
-    } else {
-      // Other read tools (SEARCH_NAME) process normally
+    } else if (tool.name === 'SEARCH_CONTENT') {
+      // Execute the search
+      const rawResult = await executeTool(tool);
+      
+      if (typeof rawResult === 'string' && rawResult.startsWith('Error:')) {
+        await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + rawResult);
+      } else {
+        const title = 'Search results for "' + tool.params.regex + '"';
+        
+        // For search results, check if we need to split into multiple blocks
+        if (rawResult.length <= SEARCH_BLOCK_SIZE) {
+          temporaryBlocks.push({ title, content: rawResult });
+        } else {
+          // Split search results into blocks
+          const lines = rawResult.split('\n');
+          const searchBlocks = [];
+          let currentBlock = [];
+          let currentSize = 0;
+          
+          for (let j = 0; j < lines.length; j++) {
+            const line = lines[j];
+            const lineSize = line.length + 1; // +1 for newline
+            
+            // Check if this is a result boundary (new file match)
+            const isNewResult = line.match(/^[^\s].*\(lines \d+-\d+\):$/);
+            
+            if (isNewResult && currentSize > 0 && currentSize + lineSize > SEARCH_BLOCK_SIZE) {
+              // Start a new block at result boundary
+              searchBlocks.push(currentBlock.join('\n'));
+              currentBlock = [line];
+              currentSize = lineSize;
+            } else {
+              currentBlock.push(line);
+              currentSize += lineSize;
+            }
+          }
+          
+          // Add the last block
+          if (currentBlock.length > 0) {
+            searchBlocks.push(currentBlock.join('\n'));
+          }
+          
+          // Create numbered blocks
+          for (let k = 0; k < searchBlocks.length; k++) {
+            temporaryBlocks.push({
+              title: title,
+              content: searchBlocks[k],
+              blockNumber: k + 1,
+              totalBlocks: searchBlocks.length
+            });
+          }
+        }
+      }
+    } else if (tool.name === 'SEARCH_NAME') {
+      // Other read tools process normally
       const result = await executeTool(tool);
       await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + result);
+    }
+  }
+  
+  // Add all temporary blocks to conversation with numbering
+  if (temporaryBlocks.length > 0) {
+    for (let i = 0; i < temporaryBlocks.length; i++) {
+      const block = temporaryBlocks[i];
+      // Use block's own numbering if it has it (for split search results)
+      const blockNumber = block.blockNumber || (i + 1);
+      const totalBlocks = block.totalBlocks || temporaryBlocks.length;
+      
+      const tempBlock = utils.formatTemporaryBlock(block.title, block.content, blockNumber, totalBlocks);
+      await updateConversation(tempBlock);
     }
   }
   
@@ -423,8 +482,8 @@ async function handleReadResponse(responseText, tools) {
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
   
-  if (hasTemporaryBlocks) {
-    console.log('✓ Temporary content blocks added, extraction prompt ready');
+  if (temporaryBlocks.length > 0) {
+    console.log('✓ Added ' + temporaryBlocks.length + ' temporary content blocks, extraction prompt ready');
   } else {
     console.log('✓ Read operations complete, next prompt ready');
   }
@@ -493,9 +552,9 @@ async function handleFormatError(errorMessage) {
     responseText + '\n' +
     '--- END OF YOUR INVALID RESPONSE ---\n\n' +
     'Please fix your response format. Remember to:\n' +
-    '1. Start with: ┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n' +
-    '2. Wrap each line with │ ... │\n' +
-    '3. End with: └─────────────────────────────────────────────────────────────────────┘';
+    '1. Start with: ┌─ ASSISTANT ─────────────────────────────────────────────────────────\n' +
+    '2. Wrap each line with │ ...\n' +
+    '3. End with: └─────────────────────────────────────────────────────────────────────';
   
   await updateConversation(errorResponse);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -1056,14 +1115,14 @@ async function updateConversation(newMessage) {
         if (i === 0) {
           // First line with SYSTEM: prefix
           const content = line.slice('SYSTEM:'.length).trim();
-          const wrapped = utils.wrapText(content, 62); // Leave room for "SYSTEM: "
+          const wrapped = utils.wrapText(content, 60); // Leave room for "SYSTEM: "
           wrappedLines.push('SYSTEM: ' + wrapped[0]);
           for (let j = 1; j < wrapped.length; j++) {
             wrappedLines.push('        ' + wrapped[j].replace(/^\.\.\.+ /, '')); // Remove ... and indent
           }
         } else {
           // Subsequent lines
-          const wrapped = utils.wrapText(line, 62);
+          const wrapped = utils.wrapText(line, 60);
           for (let j = 0; j < wrapped.length; j++) {
             wrappedLines.push('        ' + wrapped[j].replace(/^\.\.\.+ /, ''));
           }
@@ -1074,14 +1133,14 @@ async function updateConversation(newMessage) {
   } else if (newMessage.startsWith('> ')) {
     // Wrap user messages without continuation markers
     const content = newMessage.slice(2);
-    const wrapped = utils.wrapText(content, 68); // Leave room for "> "
+    const wrapped = utils.wrapText(content, 66); // Leave room for "> "
     const cleanWrapped = wrapped.map(function(line) {
       return line.replace(/^\.\.\.+ /, '');
     });
     wrappedMessage = '> ' + cleanWrapped.join('\n  '); // Simple indent for continuation
   } else if (newMessage.includes('┌─ ASSISTANT')) {
-    // Fix padding in assistant messages (they keep ... for continuation)
-    wrappedMessage = utils.fixBoxPadding(newMessage);
+    // Fix box format for assistant messages (remove right border if present)
+    wrappedMessage = fixAssistantBoxFormat(newMessage);
   } else if (newMessage.includes('╔═ TEMPORARY:')) {
     // Temporary blocks are already formatted
     wrappedMessage = newMessage;
@@ -1177,54 +1236,9 @@ function formatSystemToolResult(message) {
       }
     }
     
-    // Format the content line
+    // Format the content line without right border
     if (line.trim() || line === '') {
-      // Handle different line lengths
-      const maxContentWidth = boxWidth - 4; // Account for "║ " prefix and " ║" suffix
-      
-      // For very long lines without spaces, force break them
-      if (line.length > maxContentWidth && !line.includes(' ')) {
-        let remaining = line;
-        while (remaining.length > 0) {
-          const chunk = remaining.substring(0, maxContentWidth);
-          remaining = remaining.substring(maxContentWidth);
-          result += '║ ' + chunk + ' '.repeat(Math.max(0, maxContentWidth - chunk.length)) + ' ║\n';
-        }
-      } else if (line.length <= maxContentWidth) {
-        result += '║ ' + line + ' '.repeat(maxContentWidth - line.length) + ' ║\n';
-      } else {
-        // Word wrap for lines with spaces
-        const words = line.split(' ');
-        let currentLine = '';
-        
-        for (const word of words) {
-          if (currentLine.length + word.length + 1 <= maxContentWidth) {
-            currentLine += (currentLine ? ' ' : '') + word;
-          } else {
-            if (currentLine) {
-              result += '║ ' + currentLine + ' '.repeat(maxContentWidth - currentLine.length) + ' ║\n';
-            }
-            // Handle words longer than max width
-            if (word.length > maxContentWidth) {
-              let remaining = word;
-              while (remaining.length > maxContentWidth) {
-                result += '║ ' + remaining.substring(0, maxContentWidth) + ' ║\n';
-                remaining = remaining.substring(maxContentWidth);
-              }
-              currentLine = remaining;
-            } else {
-              currentLine = word;
-            }
-          }
-        }
-        
-        if (currentLine) {
-          result += '║ ' + currentLine + ' '.repeat(maxContentWidth - currentLine.length) + ' ║\n';
-        }
-      }
-    } else {
-      // Empty line
-      result += '║' + ' '.repeat(boxWidth - 2) + '║\n';
+      result += '║ ' + line + '\n';
     }
   }
   
@@ -1232,6 +1246,33 @@ function formatSystemToolResult(message) {
   result += '╚' + '═'.repeat(boxWidth - 2) + '╝';
   
   return result;
+}
+
+function fixAssistantBoxFormat(text) {
+  const lines = text.split('\n');
+  const fixedLines = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    if (line.includes('┌─ ASSISTANT')) {
+      // Fix top border - should end with straight line, not corner
+      const fixedLine = line.replace(/┐\s*$/, '');
+      fixedLines.push(fixedLine);
+    } else if (line.includes('└─')) {
+      // Fix bottom border - should end with straight line, not corner
+      const fixedLine = line.replace(/┘\s*$/, '');
+      fixedLines.push(fixedLine);
+    } else if (line.startsWith('│')) {
+      // Remove right border and trim
+      const content = line.substring(1).replace(/\s*│\s*$/, '').trimEnd();
+      fixedLines.push('│ ' + content);
+    } else {
+      fixedLines.push(line);
+    }
+  }
+  
+  return fixedLines.join('\n');
 }
 
 async function gitCommitAndPush(fileName, description) {
@@ -1460,10 +1501,34 @@ async function buildExtractionPrompt(tempBlock) {
   try {
     console.log('✓ Building extraction prompt for: ' + tempBlock.title);
     
+    // Count total temporary blocks
+    const conversation = await utils.readFileIfExists('conversation.md');
+    const allTempBlocks = [];
+    const lines = conversation.split('\n');
+    let currentSearchLine = 0;
+    
+    while (currentSearchLine < lines.length) {
+      const remainingConversation = lines.slice(currentSearchLine).join('\n');
+      const block = utils.findTemporaryBlock(remainingConversation);
+      if (!block.found) break;
+      
+      // Adjust line numbers to be relative to full conversation
+      block.startLine += currentSearchLine;
+      block.endLine += currentSearchLine;
+      allTempBlocks.push(block);
+      
+      // Move search position past this block
+      currentSearchLine = block.endLine + 1;
+    }
+    
+    // Find which block number this is
+    const blockNumber = allTempBlocks.findIndex(b => b.startLine === tempBlock.startLine) + 1;
+    const totalBlocks = allTempBlocks.length;
+    
     // Determine the type of content from the title
     const isDirectory = tempBlock.title.includes('Contents of ');
     const isSearchResult = tempBlock.title.includes('Content matches') || tempBlock.title.includes('Files found') || tempBlock.title.includes('Search results');
-    const isFileContent = tempBlock.title.includes('Content of ') && !isDirectory;
+    const isFileContent = (tempBlock.title.includes('.') && !isDirectory && !isSearchResult) || tempBlock.title.includes('Content of ');
     
     // Try to determine if it's code or requirements based on file extension
     let isCode = true; // Default to code
@@ -1483,7 +1548,7 @@ async function buildExtractionPrompt(tempBlock) {
     const conversation = await utils.readFileIfExists('conversation.md');
     
     // Build the extraction prompt
-    let prompt = `# Data Extraction Task
+    let prompt = `# Data Extraction Task (Block ${blockNumber} of ${totalBlocks})
 
 You are reviewing data from a ${isDirectory ? 'directory listing' : isFileContent ? 'file' : 'search result'} to extract relevant information.
 
@@ -1494,6 +1559,7 @@ You are reviewing data from a ${isDirectory ? 'directory listing' : isFileConten
 3) Be thorough but concise - extract the most important information rather than copying large sections verbatim
 4) You won't see this data again, so capture everything you might need
 5) Just write your extraction as plain text - no formatting or tools needed
+6) This is block ${blockNumber} of ${totalBlocks} - there ${totalBlocks > 1 ? 'are more blocks to process' : 'is only this block'}
 
 ## Current Context
 
@@ -1638,6 +1704,8 @@ module.exports = { buildPrompt: buildPrompt };
 
 // utils.js
 
+// utils.js
+
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -1704,7 +1772,7 @@ function parseToolBlocks(text) {
   const tools = [];
   
   // Remove the box wrapper if present
-  const boxMatch = text.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
+  const boxMatch = text.match(/┌─ ASSISTANT[^─]*─+\s*\n([\s\S]*?)\n\s*└─+/);
   let content = text;
   
   if (boxMatch) {
@@ -1715,10 +1783,10 @@ function parseToolBlocks(text) {
     
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      // Remove the leading "│ " and trailing " │" or "│"
-      const cleaned = line.replace(/^│\s?/, '').replace(/\s*│\s*$/, '');
-      if (cleaned.length > 0) {
-        cleanedLines.push(cleaned);
+      // Remove the leading "│ " 
+      if (line.startsWith('│')) {
+        const content = line.substring(1).trimStart();
+        cleanedLines.push(content);
       }
     }
     
@@ -1994,7 +2062,7 @@ function validateResponseType(text, tools) {
   if (!hasBox) {
     return {
       valid: false,
-      error: 'Response must be wrapped in ASCII box starting with ┌─ ASSISTANT ─┐'
+      error: 'Response must be wrapped in ASCII box starting with ┌─ ASSISTANT ─'
     };
   }
   
@@ -2025,12 +2093,27 @@ function replaceToolsWithIndicators(text, tools) {
 }
 
 function hasBoxClosure(text) {
-  return /└─+┘/.test(text);
+  return /└─+/.test(text);
 }
 
 function validateMessageFormat(text) {
   if (!text.includes('┌─ ASSISTANT') || !hasBoxClosure(text)) {
     throw new Error('Invalid format: Response must be wrapped in complete ASCII box');
+  }
+  
+  // Check that lines start with "│ " (but don't require right border)
+  const lines = text.split('\n');
+  let inBox = false;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.includes('┌─ ASSISTANT')) {
+      inBox = true;
+    } else if (line.includes('└─')) {
+      inBox = false;
+    } else if (inBox && line.trim() && !line.startsWith('│')) {
+      throw new Error('Invalid format: Content lines must start with "│ "');
+    }
   }
   
   return true;
@@ -2356,7 +2439,7 @@ function getCodebasePath(relativePath) {
 }
 
 function wrapText(text, maxWidth) {
-  if (!maxWidth) maxWidth = 70;
+  if (!maxWidth) maxWidth = 68;  // Default to 68 chars for content
   const words = text.split(' ');
   const lines = [];
   let currentLine = '';
@@ -2382,25 +2465,24 @@ function formatInBox(content, width) {
   
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (line.length <= width - 4) { // Account for box borders
+    if (line.length <= width - 2) { // Account for "│ " prefix only
       wrappedLines.push(line);
     } else {
       // Wrap long lines
-      const wrapped = wrapText(line, width - 4);
+      const wrapped = wrapText(line, width - 2);
       wrappedLines.push(...wrapped);
     }
   }
   
   // Build box
-  let result = '┌─ ASSISTANT ';
-  result += '─'.repeat(width - result.length - 1) + '┐\n';
+  let result = '┌─ ASSISTANT ─────────────────────────────────────────────────────────\n';
   
   for (let i = 0; i < wrappedLines.length; i++) {
     const line = wrappedLines[i];
-    result += '│ ' + line + ' '.repeat(width - line.length - 4) + ' │\n';
+    result += '│ ' + line + '\n';
   }
   
-  result += '└' + '─'.repeat(width - 2) + '┘';
+  result += '└─────────────────────────────────────────────────────────────────────';
   return result;
 }
 
@@ -2429,17 +2511,17 @@ function fixBoxPadding(text) {
     const line = lines[i];
     
     if (line.includes('┌─ ASSISTANT')) {
-      // Top border - ensure it's exactly 70 chars
-      const prefix = '┌─ ASSISTANT ';
-      fixedLines.push(prefix + '─'.repeat(70 - prefix.length - 1) + '┐');
+      // Top border - remove corner if present
+      const fixedLine = line.replace(/┐\s*$/, '');
+      fixedLines.push(fixedLine);
     } else if (line.includes('└─')) {
-      // Bottom border
-      fixedLines.push('└' + '─'.repeat(68) + '┘');
+      // Bottom border - remove corner if present
+      const fixedLine = line.replace(/┘\s*$/, '');
+      fixedLines.push(fixedLine);
     } else if (line.startsWith('│')) {
-      // Content line - ensure proper padding (66 chars for content + 4 for borders = 70)
-      const content = line.substring(1).replace(/\s*│\s*$/, '');
-      const paddedContent = content + ' '.repeat(Math.max(0, 66 - content.length));
-      fixedLines.push('│ ' + paddedContent + ' │');
+      // Content line - just ensure it starts with "│ "
+      const content = line.substring(1).trimStart();
+      fixedLines.push('│ ' + content);
     } else {
       fixedLines.push(line);
     }
@@ -2449,12 +2531,12 @@ function fixBoxPadding(text) {
 }
 
 // New functions for temporary block support
-function findTemporaryBlock(conversation) {
+function findTemporaryBlock(conversation, startFrom = 0) {
   // Look for temporary content blocks in the conversation
   const tempStartPattern = /╔═ TEMPORARY: (.+?) ═+╗/;
   const lines = conversation.split('\n');
   
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = startFrom; i < lines.length; i++) {
     const match = lines[i].match(tempStartPattern);
     if (match) {
       // Found a temporary block, extract its details
@@ -2495,13 +2577,18 @@ function findTemporaryBlock(conversation) {
   return { found: false };
 }
 
-function formatTemporaryBlock(title, content) {
+function formatTemporaryBlock(title, content, blockNumber = null, totalBlocks = null) {
   const boxWidth = 70;
   const lines = content.split('\n');
   let result = '';
   
-  // Format the header
-  let headerText = ' TEMPORARY: ' + title + ' ';
+  // Format the header with optional numbering
+  let headerText = ' TEMPORARY: ' + title;
+  if (blockNumber && totalBlocks) {
+    headerText += ' (' + blockNumber + ' of ' + totalBlocks + ')';
+  }
+  headerText += ' ';
+  
   if (headerText.length > boxWidth - 2) {
     headerText = headerText.substring(0, boxWidth - 5) + '... ';
   }
@@ -2589,36 +2676,33 @@ You are an AI development assistant helping with requirements analysis and code 
   - Your response must either be READ or WRITE response type
   - ALL your output must be tool uses based on the below format
   - No text is allowed before/after/between tool uses
-2) Write "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐" to your output
+2) Write "┌─ ASSISTANT ─────────────────────────────────────────────────────────" to your output
 3) Write your response
   - Start each line with "│ "
   - Put your response into 68 character lines (content only)
   - For wrapping, show by starting the continuation line with "... "
-  - Pad with spaces to 68 characters if needed
-  - End each line with "│"
-  - Total line width will be exactly 70 characters including borders
-4) Write "└─────────────────────────────────────────────────────────────────────┘" to end your output
+4) Write "└─────────────────────────────────────────────────────────────────────" to end your output
 
 ## CRITICAL: MESSAGE FORMAT
 
 **You MUST wrap your entire response in an ASCII box like this:**
 
 \`\`\`
-┌─ ASSISTANT ─────────────────────────────────────────────────────────┐
-│ [MESSAGE]                                                           │
-│ Your message content here, wrapped at 70 characters for             │
-│ ... readability. Long lines will automatically wrap with "..."      │
-│                                                                     │
-│ [READ] .                                                            │
-│ Getting project overview                                            │
-│                                                                     │
-│ [SEARCH_NAME] .*very-long-pattern-that-exceeds-width.*$ src/folder  │
-│ ... /with/very/long/path                                            │
-│ Searching for files with extremely long regex patterns              │
-└─────────────────────────────────────────────────────────────────────┘
+┌─ ASSISTANT ─────────────────────────────────────────────────────────
+│ [MESSAGE]
+│ Your message content here, wrapped at 68 characters for
+│ ... readability. Long lines will automatically wrap with "..."
+│ 
+│ [READ_CODE] .
+│ Getting project overview
+│ 
+│ [SEARCH_NAME] .*very-long-pattern-that-exceeds-width.*$ src/folder
+│ ... /with/very/long/path
+│ Searching for files with extremely long regex patterns
+└─────────────────────────────────────────────────────────────────────
 \`\`\`
 
-**IMPORTANT: The box must be exactly 70 characters wide. Use "..." at the start of wrapped lines.**
+**IMPORTANT: Start each line with "│ ". Use "..." at the start of wrapped lines.**
 
 ## RESPONSE TYPE RULES
 
@@ -2928,7 +3012,7 @@ Found Express.js authentication setup with session management
 
 ## IMPORTANT RULES
 
-- **Box dimensions**: Content is 68 chars wide, total box width is 70 chars
+- **Box format**: Content lines start with "│ "
 - **Complete the box**: Always close your response with the bottom border
 - **Wrap long lines**: Use "..." at the start of continuation lines
 - **Strict type separation**: Use only READ tools or only WRITE tools per response
@@ -3019,12 +3103,12 @@ function generatePrompt(options) {
   
   // Add conversation history with example
   if (conversationHistory) {
-    prompt += '\n\nCONVERSATION HISTORY:\n\n> Are you ready to help?\n\nASSISTANT: yes\n\n> Your response is not in the correct format. You MUST wrap your response in an ascii box (your first output line must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐") and you can ONLY use tool uses, not free form text.\n\n┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n│ [MESSAGE]                                                           │\n│ Here\'s another message in your specified format. Is this correct?   │\n└─────────────────────────────────────────────────────────────────────┘\n\n> yes\n\n┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n│ [MESSAGE]                                                           │\n│ How can I help you?                                                 │\n└─────────────────────────────────────────────────────────────────────┘\n\n' + conversationHistory;
+    prompt += '\n\nCONVERSATION HISTORY:\n\n> Are you ready to help?\n\nASSISTANT: yes\n\n> Your response is not in the correct format. You MUST wrap your response in an ascii box (your first output line must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────") and you can ONLY use tool uses, not free form text.\n\n┌─ ASSISTANT ─────────────────────────────────────────────────────────\n│ [MESSAGE]\n│ Here\'s another message in your specified format. Is this correct?\n└─────────────────────────────────────────────────────────────────────\n\n> yes\n\n┌─ ASSISTANT ─────────────────────────────────────────────────────────\n│ [MESSAGE]\n│ How can I help you?\n└─────────────────────────────────────────────────────────────────────\n\n' + conversationHistory;
   }
   
   // Add final instructions
   prompt += '\n\nGenerate your response as the assistant.';
-  prompt += '\n\nFINAL REMINDER: The first line of your response must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐" and your responses can only contain tool uses, no plain text messages';
+  prompt += '\n\nFINAL REMINDER: The first line of your response must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────" and your responses can only contain tool uses, no plain text messages.';
   
   return prompt;
 }
@@ -3491,16 +3575,16 @@ function buildPromptFromAllocations(allocations, mode) {
     
     // Add example if needed
     conversationSection += '> Are you ready to help?\n\nASSISTANT: yes\n\n' +
-      '> Your response is not in the correct format. You MUST wrap your response in an ascii box (your first output line must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐") and you can ONLY use tool uses, not free form text.\n\n' +
-      '┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n' +
-      '│ [MESSAGE]                                                           │\n' +
-      '│ Here\'s another message in your specified format. Is this correct?   │\n' +
-      '└─────────────────────────────────────────────────────────────────────┘\n\n' +
+      '> Your response is not in the correct format. You MUST wrap your response in an ascii box (your first output line must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────") and you can ONLY use tool uses, not free form text.\n\n' +
+      '┌─ ASSISTANT ─────────────────────────────────────────────────────────\n' +
+      '│ [MESSAGE]\n' +
+      '│ Here\'s another message in your specified format. Is this correct?\n' +
+      '└─────────────────────────────────────────────────────────────────────\n\n' +
       '> yes\n\n' +
-      '┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n' +
-      '│ [MESSAGE]                                                           │\n' +
-      '│ How can I help you?                                                 │\n' +
-      '└─────────────────────────────────────────────────────────────────────┘\n\n';
+      '┌─ ASSISTANT ─────────────────────────────────────────────────────────\n' +
+      '│ [MESSAGE]\n' +
+      '│ How can I help you?\n' +
+      '└─────────────────────────────────────────────────────────────────────\n\n';
     
     if (allocations.conversation.summary) {
       conversationSection += allocations.conversation.summary + '\n\n';
@@ -3512,7 +3596,7 @@ function buildPromptFromAllocations(allocations, mode) {
   
   // Add final instructions
   sections.push('Generate your response as the assistant.');
-  sections.push('FINAL REMINDER: The first line of your response must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐" and your responses can only contain tool uses, no plain text messages');
+  sections.push('FINAL REMINDER: The first line of your response must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────" and your responses can only contain tool uses, no plain text messages.');
   
   return sections.join('\n\n');
 }
