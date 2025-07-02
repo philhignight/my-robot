@@ -1,5 +1,7 @@
 // reset.js
 
+// reset.js
+
 const fs = require('fs').promises;
 const path = require('path');
 const utils = require('./utils');
@@ -73,6 +75,8 @@ if (require.main === module) {
 module.exports = { reset: reset };
 
 // ==========================================
+
+// watcher.js
 
 // watcher.js
 
@@ -205,6 +209,8 @@ module.exports = { startWatching: startWatching };
 
 // process-response.js
 
+// process-response.js
+
 const fs = require('fs').promises;
 const path = require('path');
 const utils = require('./utils');
@@ -213,6 +219,16 @@ async function processResponse() {
   try {
     const responseText = await utils.readFileIfExists('ai-response.md');
     if (!responseText.trim()) return;
+    
+    // Check for temporary blocks that need resolution
+    const conversation = await utils.readFileIfExists('conversation.md');
+    const tempBlock = utils.findTemporaryBlock(conversation);
+    
+    if (tempBlock.found) {
+      // We're in extraction mode
+      await handleExtractionResponse(responseText, tempBlock);
+      return;
+    }
     
     const pendingChanges = await utils.readFileIfExists('pending-changes.json');
     if (pendingChanges) {
@@ -262,6 +278,93 @@ async function processResponse() {
     
   } catch (err) {
     console.error('Error processing response:', err);
+    await handleFatalError('Error processing response: ' + err.message);
+  }
+}
+
+async function handleFatalError(message) {
+  console.error('💥 FATAL ERROR: ' + message);
+  
+  const errorMessage = 'SYSTEM: FATAL ERROR - ' + message + '\n\n' +
+    'The system encountered an unrecoverable error and must exit.\n' +
+    'Please check the logs and restart the watcher.';
+  
+  await updateConversation(errorMessage);
+  
+  // Exit the process
+  process.exit(1);
+}
+
+async function handleExtractionResponse(responseText, tempBlock) {
+  try {
+    // Validate the extraction response
+    utils.validateMessageFormat(responseText);
+    
+    // Parse tools (should only be MESSAGE)
+    const tools = utils.parseToolBlocks(responseText);
+    
+    // Check that only MESSAGE tool is used
+    const nonMessageTools = tools.filter(t => t.name !== 'MESSAGE');
+    if (nonMessageTools.length > 0) {
+      console.error('❌ Extraction response can only use [MESSAGE] tool');
+      await handleResponseTypeError('Extraction response can only use [MESSAGE] tool', responseText);
+      return;
+    }
+    
+    // Get the extraction content
+    const messageTools = tools.filter(t => t.name === 'MESSAGE');
+    let extractedContent = '';
+    
+    if (messageTools.length > 0) {
+      extractedContent = messageTools.map(t => t.params.content).join('\n\n');
+    } else {
+      // No MESSAGE tool, try to extract from the box content
+      const boxMatch = responseText.match(/┌─ ASSISTANT[^┐]*┐\s*([\s\S]*?)\s*└─+┘/);
+      if (boxMatch) {
+        const lines = boxMatch[1].split('\n');
+        extractedContent = lines
+          .map(line => line.replace(/^│\s?/, '').replace(/\s*│\s*$/, ''))
+          .filter(line => line.length > 0)
+          .join('\n');
+      }
+    }
+    
+    if (!extractedContent.trim()) {
+      extractedContent = '[No relevant information found]';
+    }
+    
+    // Remove the temporary block from conversation
+    const conversation = await utils.readFileIfExists('conversation.md');
+    const cleanedConversation = utils.removeTemporaryBlock(conversation, tempBlock.startLine, tempBlock.endLine);
+    
+    // Create permanent summary block
+    const summaryBlock = formatSystemToolResult('SYSTEM: Read summary of ' + tempBlock.title.replace('TEMPORARY: ', '') + '\n' + extractedContent);
+    
+    // Update conversation with cleaned version + summary
+    const lines = cleanedConversation.split('\n');
+    const historyIndex = lines.findIndex(line => line.includes('=== CONVERSATION HISTORY ==='));
+    const waitingIndex = lines.findIndex(line => line.includes('=== WAITING FOR YOUR MESSAGE ==='));
+    
+    let historyContent = '';
+    if (historyIndex !== -1 && waitingIndex > historyIndex) {
+      historyContent = lines.slice(historyIndex + 1, waitingIndex).join('\n').trim();
+    }
+    
+    const newHistory = historyContent + (historyContent ? '\n\n' : '') + summaryBlock;
+    const updated = '=== CONVERSATION HISTORY ===\n\n' + newHistory + '\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]';
+    
+    await fs.writeFile('conversation.md', updated, 'utf8');
+    console.log('✓ Extraction complete, summary added to conversation');
+    
+    // Clear response and build next prompt
+    await fs.writeFile('ai-response.md', '', 'utf8');
+    const buildPrompt = require('./message-to-prompt').buildPrompt;
+    await buildPrompt();
+    console.log('✓ Next prompt ready');
+    
+  } catch (err) {
+    console.error('Error handling extraction response:', err);
+    await handleFatalError('Failed to process extraction response: ' + err.message);
   }
 }
 
@@ -300,17 +403,43 @@ async function handleReadResponse(responseText, tools) {
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   await updateConversation(cleanResponse);
   
-  // Process all read tools
+  // Process each read tool using two-stage approach
   for (let i = 0; i < tools.length; i++) {
     const tool = tools[i];
-    const result = await executeTool(tool);
     
-    // Add tool result to conversation
-    const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-    await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + resultText);
+    if (tool.name === 'READ' || tool.name === 'SEARCH_CONTENT') {
+      // Execute the tool
+      const result = await executeTool(tool);
+      
+      if (typeof result === 'string' && result.startsWith('Error:')) {
+        // Error occurred, add to conversation normally
+        await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + result);
+      } else {
+        // Add temporary block with full content
+        const tempTitle = tool.name === 'READ' 
+          ? 'Content of ' + (tool.params.file_name || tool.params.path || '.')
+          : 'Search results for "' + tool.params.regex + '"';
+        
+        const tempBlock = utils.formatTemporaryBlock(tempTitle, result);
+        await updateConversation(tempBlock);
+        
+        // Clear response and build extraction prompt
+        await fs.writeFile('ai-response.md', '', 'utf8');
+        const buildPrompt = require('./message-to-prompt').buildPrompt;
+        await buildPrompt();
+        console.log('✓ Temporary content added, extraction prompt ready');
+        
+        // Stop processing further tools - one at a time
+        return;
+      }
+    } else {
+      // Other read tools (SEARCH_NAME) process normally
+      const result = await executeTool(tool);
+      await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + result);
+    }
   }
   
-  // Clear response and build next prompt
+  // All tools processed, clear response and build next prompt
   await fs.writeFile('ai-response.md', '', 'utf8');
   const buildPrompt = require('./message-to-prompt').buildPrompt;
   await buildPrompt();
@@ -926,7 +1055,8 @@ async function updateConversation(newMessage) {
                         newMessage.includes('Content of ') ||
                         newMessage.includes('Contents of ') ||
                         newMessage.includes('Files found:') ||
-                        newMessage.includes('Content matches');
+                        newMessage.includes('Content matches') ||
+                        newMessage.includes('Read summary of ');
     
     if (isToolResult) {
       // Format as special system box
@@ -967,6 +1097,9 @@ async function updateConversation(newMessage) {
   } else if (newMessage.includes('┌─ ASSISTANT')) {
     // Fix padding in assistant messages (they keep ... for continuation)
     wrappedMessage = utils.fixBoxPadding(newMessage);
+  } else if (newMessage.includes('╔═ TEMPORARY:')) {
+    // Temporary blocks are already formatted
+    wrappedMessage = newMessage;
   }
   
   const lines = conversation.split('\n');
@@ -1012,6 +1145,7 @@ function formatSystemToolResult(message) {
   const isDirectoryListing = title.includes('Contents of ');
   const isSearchResult = title.includes('Content matches') || title.includes('Files found');
   const isError = title.includes('Error');
+  const isReadSummary = title.includes('Read summary of ');
   
   // Format the header - handle long titles
   let headerText = ' SYSTEM: ' + title + ' ';
@@ -1032,7 +1166,7 @@ function formatSystemToolResult(message) {
     lineCount++;
     
     // For file content, track actual line numbers
-    if (isFileContent) {
+    if (isFileContent && !isReadSummary) {
       const lineMatch = line.match(/^(\d+):\s/);
       if (lineMatch) {
         actualLineNumber = parseInt(lineMatch[1]);
@@ -1040,7 +1174,7 @@ function formatSystemToolResult(message) {
     }
     
     // Check if we need a continuation header (every 50 lines for file content)
-    if (isFileContent && actualLineNumber > 50 && (actualLineNumber - 1) % 50 === 0) {
+    if (isFileContent && !isReadSummary && actualLineNumber > 50 && (actualLineNumber - 1) % 50 === 0) {
       const fileName = title.replace('Content of ', '').replace('Tool result (READ)', '').trim();
       const endLine = Math.min(actualLineNumber + 49, actualLineNumber + contentLines.length - i - 1);
       const contTitle = ' SYSTEM: Continuing ' + fileName + 
@@ -1142,6 +1276,8 @@ module.exports = { processResponse: processResponse };
 
 // message-to-prompt.js
 
+// message-to-prompt.js
+
 const fs = require('fs').promises;
 const utils = require('./utils');
 const { generatePrompt } = require('./prompt-generator');
@@ -1237,15 +1373,23 @@ async function executeTwoLevelList(params) {
   }
 }
 
-async function buildPrompt() {
+async function buildPrompt(extractionMode = false) {
   try {
     await utils.ensureDir('ai-managed');
+    
+    // Check for unresolved temporary blocks
+    const conversation = await utils.readFileIfExists('conversation.md');
+    const tempBlock = utils.findTemporaryBlock(conversation);
+    
+    if (tempBlock.found && !extractionMode) {
+      // We have a temporary block, build extraction prompt instead
+      return buildExtractionPrompt(tempBlock);
+    }
     
     const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
     const goals = await utils.readFileIfExists('goals.md');
     const context = await utils.readFileIfExists('ai-managed/context.md');
     const discoveries = await utils.readFileIfExists('ai-managed/discoveries.md');
-    const conversation = await utils.readFileIfExists('conversation.md');
     const explorationFindings = await utils.readFileIfExists('ai-managed/exploration-findings.md');
     const detailedPlan = await utils.readFileIfExists('ai-managed/detailed-plan.md');
     
@@ -1327,9 +1471,160 @@ async function buildPrompt() {
   }
 }
 
+async function buildExtractionPrompt(tempBlock) {
+  try {
+    console.log('✓ Building extraction prompt for: ' + tempBlock.title);
+    
+    // Determine the type of content from the title
+    const isDirectory = tempBlock.title.includes('Contents of ');
+    const isSearchResult = tempBlock.title.includes('Content matches') || tempBlock.title.includes('Files found');
+    const isFileContent = tempBlock.title.includes('Content of ');
+    
+    // Get current context
+    const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
+    const goals = await utils.readFileIfExists('goals.md');
+    const context = await utils.readFileIfExists('ai-managed/context.md');
+    const discoveries = await utils.readFileIfExists('ai-managed/discoveries.md');
+    const conversation = await utils.readFileIfExists('conversation.md');
+    
+    // Build the extraction prompt
+    let prompt = `# Data Extraction Task
+
+You are reviewing data from a ${isDirectory ? 'directory listing' : isFileContent ? 'file' : 'search result'} to extract relevant information.
+
+## Instructions
+
+1) Review the data below and extract information relevant to your current task
+2) Think of this as asking yourself a question about the data and writing your response
+3) Be thorough but concise - extract the most important information rather than copying large sections verbatim
+4) You won't see this data again, so capture everything you might need
+5) Write your extraction in the standard ASCII box format
+
+## Current Context
+
+MODE: ${mode}
+
+`;
+
+    // Add goals if not default
+    if (goals && goals.trim() && goals.trim() !== '# Project Goals\n\nAdd your high-level objectives here') {
+      prompt += 'GOALS:\n' + goals.trim() + '\n\n';
+    }
+    
+    // Add recent conversation context (last 3 exchanges)
+    const lines = conversation.split('\n');
+    const exchanges = [];
+    let currentExchange = [];
+    let inAssistantBox = false;
+    
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      
+      if (line.startsWith('> ') && !inAssistantBox) {
+        if (currentExchange.length > 0) {
+          exchanges.push(currentExchange.reverse().join('\n'));
+          currentExchange = [];
+          if (exchanges.length >= 3) break;
+        }
+      }
+      
+      currentExchange.push(line);
+      
+      if (line.includes('└─') && i > 0 && lines[i-1].includes('│')) {
+        inAssistantBox = true;
+      } else if (line.includes('┌─ ASSISTANT')) {
+        inAssistantBox = false;
+      }
+    }
+    
+    if (currentExchange.length > 0 && exchanges.length < 3) {
+      exchanges.push(currentExchange.reverse().join('\n'));
+    }
+    
+    if (exchanges.length > 0) {
+      prompt += 'RECENT CONTEXT:\n' + exchanges.reverse().join('\n\n') + '\n\n';
+    }
+    
+    // Add extraction guidelines based on content type
+    if (isDirectory) {
+      prompt += `## Directory Extraction Guidelines
+
+From the directory listing, extract:
+- File paths you need to examine for your current task
+- Patterns in file organization
+- Notable subdirectories
+- Any unexpected or concerning file structures
+
+Format: List only the file paths you need to examine, one per line.
+Example:
+src/auth.js
+src/utils/validation.js
+config/database.json
+
+`;
+    } else if (isFileContent) {
+      const fileName = tempBlock.title.replace('Content of ', '').replace('TEMPORARY: ', '').trim();
+      prompt += `## Code/Document Extraction Guidelines
+
+From ${fileName}, extract information relevant to your current task:
+- Key functions/classes and their purposes
+- Important algorithms or business logic  
+- Dependencies and imports
+- Configuration values
+- Security concerns or potential issues
+- TODO/FIXME comments
+- Relevant code sections with line numbers
+- Any patterns or architectural decisions
+
+Remember: You're analyzing this to answer questions about the codebase. Extract insights, not just raw code.
+Include line number references where important (e.g., "Line 45-67: Authentication logic uses bcrypt").
+
+`;
+    } else if (isSearchResult) {
+      prompt += `## Search Result Extraction Guidelines
+
+From these search results, extract:
+- Key findings and their locations (with line numbers)
+- Patterns across multiple files
+- Relevant code snippets (with context)
+- Summary of where and how the search term is used
+- Any concerning or notable usages
+
+Focus on insights and patterns rather than listing every match.
+
+`;
+    }
+    
+    // Add the data to review
+    prompt += '## Data to Review\n\n' + tempBlock.content + '\n\n';
+    
+    // Add final instructions
+    prompt += `## Response Format
+
+Wrap your extraction in the standard ASCII box format:
+
+\`\`\`
+┌─ ASSISTANT ─────────────────────────────────────────────────────────┐
+│ [MESSAGE]                                                           │
+│ Your extracted information here...                                  │
+└─────────────────────────────────────────────────────────────────────┘
+\`\`\`
+
+Extract the relevant information now.`;
+    
+    await fs.writeFile('generated-prompt.md', prompt, 'utf8');
+    console.log('✓ Extraction prompt ready in generated-prompt.md');
+    
+  } catch (err) {
+    console.error('Error building extraction prompt:', err);
+  }
+}
+
 module.exports = { buildPrompt: buildPrompt };
 
 // ==========================================
+
+// utils.js
 
 // utils.js
 
@@ -2142,6 +2437,98 @@ function fixBoxPadding(text) {
   return fixedLines.join('\n');
 }
 
+// New functions for temporary block support
+function findTemporaryBlock(conversation) {
+  // Look for temporary content blocks in the conversation
+  const tempStartPattern = /╔═ TEMPORARY: (.+?) ═+╗/;
+  const lines = conversation.split('\n');
+  
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(tempStartPattern);
+    if (match) {
+      // Found a temporary block, extract its details
+      const title = match[1];
+      let startLine = i;
+      let endLine = -1;
+      
+      // Find the end of the block
+      for (let j = i + 1; j < lines.length; j++) {
+        if (lines[j].match(/╚═+╝/)) {
+          endLine = j;
+          break;
+        }
+      }
+      
+      if (endLine !== -1) {
+        // Extract content lines (skip the box borders)
+        const contentLines = [];
+        for (let k = startLine + 1; k < endLine; k++) {
+          const line = lines[k];
+          // Remove the "║ " prefix
+          if (line.startsWith('║ ')) {
+            contentLines.push(line.substring(2));
+          }
+        }
+        
+        return {
+          found: true,
+          title: title,
+          content: contentLines.join('\n'),
+          startLine: startLine,
+          endLine: endLine
+        };
+      }
+    }
+  }
+  
+  return { found: false };
+}
+
+function formatTemporaryBlock(title, content) {
+  const boxWidth = 70;
+  const lines = content.split('\n');
+  let result = '';
+  
+  // Format the header
+  let headerText = ' TEMPORARY: ' + title + ' ';
+  if (headerText.length > boxWidth - 2) {
+    headerText = headerText.substring(0, boxWidth - 5) + '... ';
+  }
+  const headerPadding = boxWidth - headerText.length - 2;
+  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═╗\n';
+  
+  // Add content lines
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const maxContentWidth = boxWidth - 4;
+    
+    if (line.length <= maxContentWidth) {
+      result += '║ ' + line + ' '.repeat(maxContentWidth - line.length) + ' ║\n';
+    } else {
+      // Handle long lines by breaking them
+      let remaining = line;
+      while (remaining.length > 0) {
+        const chunk = remaining.substring(0, maxContentWidth);
+        remaining = remaining.substring(maxContentWidth);
+        result += '║ ' + chunk + ' '.repeat(Math.max(0, maxContentWidth - chunk.length)) + ' ║\n';
+      }
+    }
+  }
+  
+  // Close the box
+  result += '╚' + '═'.repeat(boxWidth - 2) + '╝';
+  
+  return result;
+}
+
+function removeTemporaryBlock(conversation, startLine, endLine) {
+  const lines = conversation.split('\n');
+  const before = lines.slice(0, startLine);
+  const after = lines.slice(endLine + 1);
+  
+  return before.concat(after).join('\n');
+}
+
 module.exports = {
   CODEBASE_PATH: CODEBASE_PATH,
   ensureDir: ensureDir,
@@ -2166,10 +2553,15 @@ module.exports = {
   wrapText: wrapText,
   formatInBox: formatInBox,
   wrapSystemMessage: wrapSystemMessage,
-  fixBoxPadding: fixBoxPadding
+  fixBoxPadding: fixBoxPadding,
+  findTemporaryBlock: findTemporaryBlock,
+  formatTemporaryBlock: formatTemporaryBlock,
+  removeTemporaryBlock: removeTemporaryBlock
 };
 
 // ==========================================
+
+// prompt-generator.js
 
 // prompt-generator.js
 
