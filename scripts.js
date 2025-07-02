@@ -979,6 +979,7 @@ module.exports = { processResponse: processResponse };
 const fs = require('fs').promises;
 const utils = require('./utils');
 const { generatePrompt } = require('./prompt-generator');
+const { allocatePromptBudget, buildPromptFromAllocations } = require('./prompt-budget-allocator');
 
 async function executeTwoLevelList(params) {
   try {
@@ -1077,7 +1078,10 @@ async function buildPrompt() {
     const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
     const goals = await utils.readFileIfExists('goals.md');
     const context = await utils.readFileIfExists('ai-managed/context.md');
+    const discoveries = await utils.readFileIfExists('ai-managed/discoveries.md');
     const conversation = await utils.readFileIfExists('conversation.md');
+    const explorationFindings = await utils.readFileIfExists('ai-managed/exploration-findings.md');
+    const detailedPlan = await utils.readFileIfExists('ai-managed/detailed-plan.md');
     
     // Generate 2-level directory listing
     const listTool = {
@@ -1109,30 +1113,47 @@ async function buildPrompt() {
         .join('\n');
     }
     
-    // Check if we need to compact the conversation
-    if (conversationHistory.length > 30000) {
-      console.log('📝 Compacting conversation history...');
-      conversationHistory = utils.compactConversation(conversationHistory, 30000);
-      console.log('✓ Conversation compacted');
-    }
-    
-    // Generate the prompt using the new prompt generator
-    const prompt = generatePrompt({
+    // Generate base prompt
+    const basePrompt = generatePrompt({
       mode: mode,
-      goals: goals,
-      projectStructure: projectStructure,
-      additionalContext: context,
-      conversationHistory: conversationHistory
+      goals: '',  // We'll handle these through the allocator
+      projectStructure: '',  // We'll handle these through the allocator
+      additionalContext: '',  // We'll handle these through the allocator
+      conversationHistory: ''  // We'll handle these through the allocator
     });
     
-    await fs.writeFile('generated-prompt.md', prompt, 'utf8');
-    console.log('✓ Built prompt for ' + mode + ' mode');
+    // Prepare inputs for budget allocator
+    const inputs = {
+      basePrompt: basePrompt,
+      conversation: conversationHistory,
+      discoveries: discoveries,
+      projectStructure: projectStructure,
+      goals: goals,
+      additionalContext: context,
+      explorationFindings: explorationFindings,
+      detailedPlan: detailedPlan
+    };
     
-    if (prompt.length > 500000) {
-      console.log('⚠ Warning: Prompt is ' + prompt.length + ' chars, approaching 600k limit');
-      if (prompt.length > 550000) {
-        console.log('⚠ Consider running "npm run reset" if prompt becomes too large');
+    // Allocate budget optimally
+    const allocation = allocatePromptBudget(inputs, mode, new Date());
+    
+    // Build final prompt from allocations
+    const prompt = buildPromptFromAllocations(allocation.allocations, mode);
+    
+    await fs.writeFile('generated-prompt.md', prompt, 'utf8');
+    
+    console.log('✓ Built prompt for ' + mode + ' mode');
+    console.log('📊 Budget usage: ' + allocation.totalUsed.toLocaleString() + ' / ' + allocation.budget.toLocaleString() + ' characters (' + Math.round(allocation.totalUsed / allocation.budget * 100) + '%)');
+    
+    // Log what was included/excluded
+    for (const [category, alloc] of Object.entries(allocation.allocations)) {
+      if (alloc.excluded && alloc.excluded.length > 0) {
+        console.log('  ⚠ ' + category + ': included ' + alloc.content.length + ' chars, excluded ' + alloc.excluded.length + ' items');
       }
+    }
+    
+    if (prompt.length > 600000) {
+      console.log('⚠ Warning: Prompt exceeds 600k character limit!');
     }
     
   } catch (err) {
@@ -1313,6 +1334,49 @@ function parseToolBlocks(text) {
 function parseToolParams(toolName, args, content) {
   const params = {};
   
+  // Helper function to parse arguments with quoted string support
+  function parseArgs(argString) {
+    const args = [];
+    let current = '';
+    let inQuotes = false;
+    let escapeNext = false;
+    
+    for (let i = 0; i < argString.length; i++) {
+      const char = argString[i];
+      
+      if (escapeNext) {
+        current += char;
+        escapeNext = false;
+        continue;
+      }
+      
+      if (char === '\\') {
+        escapeNext = true;
+        continue;
+      }
+      
+      if (char === '"') {
+        inQuotes = !inQuotes;
+        continue;
+      }
+      
+      if (char === ' ' && !inQuotes) {
+        if (current) {
+          args.push(current);
+          current = '';
+        }
+      } else {
+        current += char;
+      }
+    }
+    
+    if (current) {
+      args.push(current);
+    }
+    
+    return args;
+  }
+  
   switch (toolName) {
     case 'LIST':
       params.path = args || '.';
@@ -1325,14 +1389,14 @@ function parseToolParams(toolName, args, content) {
       break;
       
     case 'SEARCH_NAME':
-      const nameArgs = args.split(/\s+/);
+      const nameArgs = parseArgs(args);
       params.regex = nameArgs[0];
       params.folder = nameArgs[1] || '.';
       params.explanation = content;
       break;
       
     case 'SEARCH_CONTENT':
-      const contentArgs = args.split(/\s+/);
+      const contentArgs = parseArgs(args);
       params.regex = contentArgs[0];
       params.folder = contentArgs[1] || '.';
       params.explanation = content;
@@ -1613,7 +1677,7 @@ function calculateImportanceWeight(importance) {
 }
 
 function compactDiscoveries(discoveries, maxCount) {
-  if (maxCount === undefined) maxCount = 50;
+  if (maxCount === undefined) maxCount = 200;
   
   const lines = discoveries.split('\n').filter(function(line) { return line.trim(); });
   if (lines.length <= maxCount) return discoveries;
@@ -1652,7 +1716,7 @@ function compactDiscoveries(discoveries, maxCount) {
 }
 
 function compactConversation(conversationHistory, maxLength) {
-  if (maxLength === undefined) maxLength = 50000; // Default max length for conversation
+  if (maxLength === undefined) maxLength = 250000; // Default max length for conversation
   
   if (conversationHistory.length <= maxLength) {
     return conversationHistory;
@@ -1695,13 +1759,13 @@ function compactConversation(conversationHistory, maxLength) {
     exchanges.push(currentExchange);
   }
   
-  if (exchanges.length <= 3) {
+  if (exchanges.length <= 10) {
     return conversationHistory; // Don't compact if very short
   }
   
-  // Keep recent exchanges (last 3) and summarize older ones
-  const recentExchanges = exchanges.slice(-3);
-  const oldExchanges = exchanges.slice(0, -3);
+  // Keep recent exchanges (last 10) and summarize older ones
+  const recentExchanges = exchanges.slice(-10);
+  const oldExchanges = exchanges.slice(0, -10);
   
   // Create summary of old exchanges
   const importantPoints = [];
@@ -1750,7 +1814,7 @@ function compactConversation(conversationHistory, maxLength) {
   
   if (decisions.length > 0) {
     summary += 'KEY DECISIONS:\n';
-    for (let i = 0; i < Math.min(decisions.length, 5); i++) {
+    for (let i = 0; i < Math.min(decisions.length, 15); i++) {
       summary += '- ' + decisions[i] + '\n';
     }
     summary += '\n';
@@ -1758,7 +1822,7 @@ function compactConversation(conversationHistory, maxLength) {
   
   if (discoveries.length > 0) {
     summary += 'KEY DISCOVERIES:\n';
-    for (let i = 0; i < Math.min(discoveries.length, 3); i++) {
+    for (let i = 0; i < Math.min(discoveries.length, 10); i++) {
       summary += '- ' + discoveries[i] + '\n';
     }
     summary += '\n';
@@ -2088,17 +2152,32 @@ Reviewing configuration
 \`\`\``,
 
   SEARCH_NAME: `**[SEARCH_NAME] pattern folder**
-Find files matching pattern
+Find files matching pattern. Use quotes for patterns with spaces. Escape quotes with backslash.
 \`\`\`
 [SEARCH_NAME] .*\\.js$ src/
 Finding all JavaScript files
+
+[SEARCH_NAME] "test.*\\.spec\\.js$" tests/
+Finding test spec files with spaces in pattern
+
+[SEARCH_NAME] "\\"quoted\\" file.*" .
+Finding files with quotes in the name
 \`\`\``,
 
   SEARCH_CONTENT: `**[SEARCH_CONTENT] pattern folder**
-Search content within files
+Search content within files. Use quotes for patterns with spaces or special characters. Escape quotes with backslash.
 \`\`\`
 [SEARCH_CONTENT] TODO|FIXME .
 Finding all TODO comments
+
+[SEARCH_CONTENT] "package com\\.example" src/
+Searching for package declarations with dots
+
+[SEARCH_CONTENT] "const\\s+myVar\\s*=" src/
+Finding const declarations with spaces
+
+[SEARCH_CONTENT] "console\\.log\\(\\"Hello\\"\\)" .
+Finding console.log with quoted strings
 \`\`\``,
 
   // WRITE tools (mode-specific)
@@ -2367,3 +2446,492 @@ function generatePrompt(options) {
 }
 
 module.exports = { generatePrompt };
+
+// ==========================================
+
+// prompt-budget-allocator.js
+
+const utils = require('./utils');
+
+// Constants
+const BUDGET_LIMIT = 590000; // 590k characters
+const BUDGET_TARGET = 0.95; // Use 95% of budget before summarizing
+
+// Calculate importance weight (same as existing system)
+function calculateImportanceWeight(importance) {
+  return Math.pow(2.5, importance - 1);
+}
+
+// Calculate recency factor with exponential decay
+function calculateRecencyFactor(date, currentDate) {
+  const ageInDays = (currentDate - date) / (1000 * 60 * 60 * 24);
+  // Exponential decay: newer items have factor close to 1, older items decay
+  // Half-life of 30 days (after 30 days, recency factor is 0.5)
+  return Math.exp(-0.693 * ageInDays / 30);
+}
+
+// Parse discovery entry
+function parseDiscovery(line) {
+  const match = line.match(/^\[([^\]]+)\] importance:(\d+) (.+)$/);
+  if (!match) return null;
+  
+  return {
+    date: new Date(match[1]),
+    importance: parseInt(match[2]),
+    content: match[3],
+    originalLine: line
+  };
+}
+
+// Score discoveries by importance and recency
+function scoreDiscoveries(discoveries, currentDate) {
+  if (!currentDate) currentDate = new Date();
+  
+  const scored = [];
+  const lines = discoveries.split('\n').filter(line => line.trim());
+  
+  for (const line of lines) {
+    const parsed = parseDiscovery(line);
+    if (!parsed) continue;
+    
+    const importanceWeight = calculateImportanceWeight(parsed.importance);
+    const recencyFactor = calculateRecencyFactor(parsed.date, currentDate);
+    
+    scored.push({
+      ...parsed,
+      importanceWeight,
+      recencyFactor,
+      score: importanceWeight * recencyFactor
+    });
+  }
+  
+  // Sort by score (highest first), with importance 10 always at top
+  return scored.sort((a, b) => {
+    // Importance 10 always stays at top
+    if (a.importance === 10 && b.importance !== 10) return -1;
+    if (b.importance === 10 && a.importance !== 10) return 1;
+    if (a.importance === 10 && b.importance === 10) {
+      // Both are 10, sort by recency
+      return b.date - a.date;
+    }
+    // Otherwise sort by combined score
+    return b.score - a.score;
+  });
+}
+
+// Category definitions
+const CATEGORY_CONFIGS = {
+  basePrompt: {
+    weight: 0, // Mandatory, always included
+    required: true,
+    selector: (content) => content,
+    summarizer: null // Cannot be summarized
+  },
+  
+  conversation: {
+    weight: 40,
+    required: false,
+    selector: (content) => {
+      // Split conversation into individual exchanges
+      const lines = content.split('\n');
+      const exchanges = [];
+      let currentExchange = [];
+      let inAssistantBox = false;
+      
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        
+        // Check if this starts a new user message
+        if (line.startsWith('> ') && currentExchange.length > 0 && !inAssistantBox) {
+          // Save previous exchange
+          exchanges.push(currentExchange.join('\n'));
+          currentExchange = [line];
+        } else {
+          currentExchange.push(line);
+          
+          // Track assistant box state
+          if (line.includes('┌─ ASSISTANT')) {
+            inAssistantBox = true;
+          } else if (line.includes('└─') && inAssistantBox) {
+            inAssistantBox = false;
+          }
+        }
+      }
+      
+      // Don't forget the last exchange
+      if (currentExchange.length > 0) {
+        exchanges.push(currentExchange.join('\n'));
+      }
+      
+      // Return in reverse order (most recent first)
+      return exchanges.reverse();
+    },
+    summarizer: (excluded) => {
+      if (excluded.length === 0) return '';
+      
+      // Extract key points from excluded exchanges
+      const decisions = [];
+      const questions = [];
+      
+      for (const exchange of excluded) {
+        const lines = exchange.split('\n');
+        for (const line of lines) {
+          if (line.includes('implement') || line.includes('create') || line.includes('build')) {
+            decisions.push(line.trim());
+          }
+          if (line.startsWith('> ') && line.includes('?')) {
+            questions.push(line.trim());
+          }
+        }
+      }
+      
+      let summary = '=== CONVERSATION SUMMARY ===\n';
+      summary += `${excluded.length} earlier exchanges summarized:\n`;
+      
+      if (decisions.length > 0) {
+        summary += '\nKey Decisions:\n';
+        decisions.slice(0, 5).forEach(d => summary += `- ${d}\n`);
+      }
+      
+      if (questions.length > 0) {
+        summary += '\nKey Questions:\n';
+        questions.slice(0, 3).forEach(q => summary += `- ${q}\n`);
+      }
+      
+      return summary;
+    }
+  },
+  
+  discoveries: {
+    weight: 25,
+    required: false,
+    selector: (content, currentDate) => {
+      const scored = scoreDiscoveries(content, currentDate);
+      return scored.map(d => d.originalLine);
+    },
+    summarizer: (excluded) => {
+      if (excluded.length === 0) return '';
+      
+      // Group by importance
+      const groups = {
+        critical: [], // 9-10
+        important: [], // 6-8
+        normal: [], // 4-5
+        minor: [] // 1-3
+      };
+      
+      for (const line of excluded) {
+        const parsed = parseDiscovery(line);
+        if (!parsed) continue;
+        
+        if (parsed.importance >= 9) groups.critical.push(parsed);
+        else if (parsed.importance >= 6) groups.important.push(parsed);
+        else if (parsed.importance >= 4) groups.normal.push(parsed);
+        else groups.minor.push(parsed);
+      }
+      
+      let summary = '=== DISCOVERY SUMMARY ===\n';
+      summary += `${excluded.length} discoveries not shown in detail:\n`;
+      
+      if (groups.critical.length > 0) {
+        summary += `\nCritical (9-10): ${groups.critical.length} findings\n`;
+        groups.critical.slice(0, 3).forEach(d => 
+          summary += `- [${d.date.toISOString().split('T')[0]}] ${d.content.substring(0, 80)}...\n`
+        );
+      }
+      
+      if (groups.important.length > 0) {
+        summary += `\nImportant (6-8): ${groups.important.length} findings\n`;
+        groups.important.slice(0, 2).forEach(d => 
+          summary += `- ${d.content.substring(0, 60)}...\n`
+        );
+      }
+      
+      if (groups.normal.length > 0) {
+        summary += `\nNormal (4-5): ${groups.normal.length} findings\n`;
+      }
+      
+      if (groups.minor.length > 0) {
+        summary += `Minor (1-3): ${groups.minor.length} findings\n`;
+      }
+      
+      return summary;
+    }
+  },
+  
+  projectStructure: {
+    weight: 15,
+    required: false,
+    selector: (content) => content,
+    summarizer: (content) => {
+      const lines = content.split('\n');
+      const fileCount = lines.filter(l => l.includes(' lines)')).length;
+      const dirCount = lines.filter(l => l.includes('/')).length;
+      return `=== PROJECT STRUCTURE SUMMARY ===\nLarge project: ${fileCount} files across ${dirCount} directories\n`;
+    }
+  },
+  
+  detailedPlan: {
+    weight: 20,
+    required: false,
+    modes: ['planning', 'implementation'],
+    selector: (content) => content,
+    summarizer: (content) => {
+      const lines = content.split('\n');
+      const tasks = lines.filter(l => l.match(/^\d+\./));
+      return `=== PLAN SUMMARY ===\nImplementation plan with ${tasks.length} tasks\n` +
+             tasks.slice(0, 5).join('\n') + 
+             (tasks.length > 5 ? `\n... and ${tasks.length - 5} more tasks` : '');
+    }
+  },
+  
+  explorationFindings: {
+    weight: 20,
+    required: false,
+    selector: (content) => content,
+    summarizer: (content) => {
+      const lines = content.split('\n');
+      const headers = lines.filter(l => l.startsWith('#'));
+      return `=== EXPLORATION SUMMARY ===\n` +
+             `Key sections: ${headers.slice(0, 3).join(', ')}\n` +
+             `Total findings: ${lines.length} lines\n`;
+    }
+  },
+  
+  goals: {
+    weight: 5,
+    required: false,
+    selector: (content) => content,
+    summarizer: null // Usually short
+  },
+  
+  additionalContext: {
+    weight: 10,
+    required: false,
+    selector: (content) => content,
+    summarizer: (content) => {
+      const lines = content.split('\n');
+      return `=== CONTEXT SUMMARY ===\n${lines.slice(0, 3).join('\n')}...\n(${lines.length} total lines)\n`;
+    }
+  }
+};
+
+// Main allocation function
+function allocatePromptBudget(inputs, mode, currentDate) {
+  const budget = BUDGET_LIMIT;
+  const targetUsage = budget * BUDGET_TARGET;
+  
+  // Filter categories by mode and availability
+  const activeCategories = [];
+  for (const [name, config] of Object.entries(CATEGORY_CONFIGS)) {
+    // Skip if mode-specific and not in current mode
+    if (config.modes && !config.modes.includes(mode)) continue;
+    
+    // Skip if no content provided
+    if (!inputs[name] || inputs[name].trim() === '') continue;
+    
+    // Skip goals if it's the default
+    if (name === 'goals' && inputs[name].trim() === '# Project Goals\n\nAdd your high-level objectives here') continue;
+    
+    activeCategories.push({
+      name,
+      config,
+      content: inputs[name],
+      weight: config.weight
+    });
+  }
+  
+  // Start with required content
+  let usedBudget = 0;
+  const allocations = {};
+  
+  // Add mandatory content first
+  for (const category of activeCategories) {
+    if (category.config.required) {
+      allocations[category.name] = {
+        content: category.content,
+        excluded: [],
+        summary: ''
+      };
+      usedBudget += category.content.length;
+    }
+  }
+  
+  // Calculate total weight for proportional allocation
+  const totalWeight = activeCategories
+    .filter(c => !c.config.required && c.weight > 0)
+    .reduce((sum, c) => sum + c.weight, 0);
+  
+  // Sort by weight (highest first)
+  const prioritizedCategories = activeCategories
+    .filter(c => !c.config.required)
+    .sort((a, b) => b.weight - a.weight);
+  
+  // Allocate content to each category
+  for (const category of prioritizedCategories) {
+    const { name, config, content } = category;
+    
+    // Calculate this category's budget
+    const categoryBudget = config.weight > 0 
+      ? Math.floor((targetUsage - usedBudget) * (config.weight / totalWeight))
+      : content.length; // Categories with 0 weight get their full content if space allows
+    
+    // Get selectable units (exchanges, discoveries, etc)
+    const units = config.selector ? config.selector(content, currentDate) : [content];
+    
+    let includedContent = '';
+    let excludedContent = [];
+    let currentSize = 0;
+    
+    // Add units until we exceed budget
+    for (let i = 0; i < units.length; i++) {
+      const unit = units[i];
+      const unitSize = unit.length + (i > 0 ? 1 : 0); // +1 for newline
+      
+      if (currentSize + unitSize <= categoryBudget || currentSize === 0) {
+        if (i > 0) includedContent += '\n';
+        includedContent += unit;
+        currentSize += unitSize;
+      } else {
+        excludedContent.push(unit);
+      }
+    }
+    
+    allocations[name] = {
+      content: includedContent,
+      excluded: excludedContent,
+      summary: ''
+    };
+    
+    usedBudget += includedContent.length;
+  }
+  
+  // Generate summaries for excluded content with remaining budget
+  const remainingBudget = budget - usedBudget;
+  let summaryBudget = remainingBudget;
+  
+  for (const category of prioritizedCategories) {
+    const { name, config } = category;
+    const allocation = allocations[name];
+    
+    if (allocation && allocation.excluded.length > 0 && config.summarizer && summaryBudget > 0) {
+      const summary = config.summarizer(allocation.excluded);
+      if (summary && summary.length <= summaryBudget) {
+        allocation.summary = summary;
+        summaryBudget -= summary.length;
+      }
+    }
+  }
+  
+  return {
+    allocations,
+    totalUsed: Object.values(allocations).reduce((sum, a) => 
+      sum + a.content.length + a.summary.length, 0
+    ),
+    budget: budget
+  };
+}
+
+// Helper to build the final prompt from allocations
+function buildPromptFromAllocations(allocations, mode) {
+  const sections = [];
+  
+  // Base prompt is always first
+  if (allocations.basePrompt) {
+    sections.push(allocations.basePrompt.content);
+  }
+  
+  // Add goals if present
+  if (allocations.goals) {
+    sections.push('GOALS:\n' + allocations.goals.content.trim());
+  }
+  
+  // Add project structure
+  if (allocations.projectStructure) {
+    if (allocations.projectStructure.summary) {
+      sections.push(allocations.projectStructure.summary.trim());
+    } else {
+      sections.push('PROJECT STRUCTURE (2 levels):\n' + allocations.projectStructure.content);
+    }
+  }
+  
+  // Add additional context
+  if (allocations.additionalContext) {
+    if (allocations.additionalContext.summary) {
+      sections.push(allocations.additionalContext.summary.trim());
+    } else {
+      sections.push('ADDITIONAL CONTEXT:\n' + allocations.additionalContext.content);
+    }
+  }
+  
+  // Add exploration findings
+  if (allocations.explorationFindings) {
+    if (allocations.explorationFindings.summary) {
+      sections.push(allocations.explorationFindings.summary.trim());
+    } else {
+      sections.push('EXPLORATION FINDINGS:\n' + allocations.explorationFindings.content);
+    }
+  }
+  
+  // Add detailed plan
+  if (allocations.detailedPlan) {
+    if (allocations.detailedPlan.summary) {
+      sections.push(allocations.detailedPlan.summary.trim());
+    } else {
+      sections.push('DETAILED PLAN:\n' + allocations.detailedPlan.content);
+    }
+  }
+  
+  // Add discoveries
+  if (allocations.discoveries) {
+    if (allocations.discoveries.summary) {
+      sections.push(allocations.discoveries.summary.trim());
+    }
+    if (allocations.discoveries.content) {
+      sections.push('DISCOVERIES:\n' + allocations.discoveries.content);
+    }
+  }
+  
+  // Add conversation history
+  if (allocations.conversation) {
+    let conversationSection = 'CONVERSATION HISTORY:\n\n';
+    
+    // Add example if needed
+    conversationSection += '> Are you ready to help?\n\nASSISTANT: yes\n\n' +
+      '> Your response is not in the correct format. You MUST wrap your response in an ascii box (your first output line must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐") and you can ONLY use tool uses, not free form text.\n\n' +
+      '┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n' +
+      '│ [MESSAGE]                                                           │\n' +
+      '│ Here\'s another message in your specified format. Is this correct?   │\n' +
+      '└─────────────────────────────────────────────────────────────────────┘\n\n' +
+      '> yes\n\n' +
+      '┌─ ASSISTANT ─────────────────────────────────────────────────────────┐\n' +
+      '│ [MESSAGE]                                                           │\n' +
+      '│ How can I help you?                                                 │\n' +
+      '└─────────────────────────────────────────────────────────────────────┘\n\n';
+    
+    if (allocations.conversation.summary) {
+      conversationSection += allocations.conversation.summary + '\n\n';
+    }
+    
+    conversationSection += allocations.conversation.content;
+    sections.push(conversationSection);
+  }
+  
+  // Add final instructions
+  sections.push('Generate your response as the assistant.');
+  sections.push('FINAL REMINDER: The first line of your response must be "┌─ ASSISTANT ─────────────────────────────────────────────────────────┐" and your responses can only contain tool uses, no plain text messages');
+  
+  return sections.join('\n\n');
+}
+
+module.exports = {
+  allocatePromptBudget,
+  buildPromptFromAllocations,
+  scoreDiscoveries,
+  calculateImportanceWeight,
+  calculateRecencyFactor,
+  parseDiscovery,
+  BUDGET_LIMIT,
+  BUDGET_TARGET,
+  CATEGORY_CONFIGS
+};
