@@ -691,7 +691,9 @@ async function executeListDirectory(params) {
       '.db', '.sqlite', '.sqlite3'
     ];
     
-    async function buildTree(dir, prefix) {
+    async function buildTree(dir, prefix, depth = 0) {
+      if (depth >= 2) return ''; // Limit to 2 levels deep
+      
       let result = '';
       const entries = await fs.readdir(dir, { withFileTypes: true });
       
@@ -721,8 +723,8 @@ async function executeListDirectory(params) {
         
         result += prefix + (isLast ? '└── ' : '├── ') + dirName + '/\n';
         
-        // Recursively build subtree
-        const subTree = await buildTree(subPath, prefix + (isLast ? '    ' : '│   '));
+        // Recursively build subtree (will stop at depth 2)
+        const subTree = await buildTree(subPath, prefix + (isLast ? '    ' : '│   '), depth + 1);
         result += subTree;
       }
       
@@ -1106,38 +1108,12 @@ async function updateConversation(newMessage) {
       // Format as special system box
       wrappedMessage = formatSystemToolResult(newMessage);
     } else {
-      // Regular system message wrapping
-      const lines = newMessage.split('\n');
-      const wrappedLines = [];
-      
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (i === 0) {
-          // First line with SYSTEM: prefix
-          const content = line.slice('SYSTEM:'.length).trim();
-          const wrapped = utils.wrapText(content, 60); // Leave room for "SYSTEM: "
-          wrappedLines.push('SYSTEM: ' + wrapped[0]);
-          for (let j = 1; j < wrapped.length; j++) {
-            wrappedLines.push('        ' + wrapped[j].replace(/^\.\.\.+ /, '')); // Remove ... and indent
-          }
-        } else {
-          // Subsequent lines
-          const wrapped = utils.wrapText(line, 60);
-          for (let j = 0; j < wrapped.length; j++) {
-            wrappedLines.push('        ' + wrapped[j].replace(/^\.\.\.+ /, ''));
-          }
-        }
-      }
-      wrappedMessage = wrappedLines.join('\n');
+      // Regular system message - no wrapping
+      wrappedMessage = newMessage;
     }
   } else if (newMessage.startsWith('> ')) {
-    // Wrap user messages without continuation markers
-    const content = newMessage.slice(2);
-    const wrapped = utils.wrapText(content, 66); // Leave room for "> "
-    const cleanWrapped = wrapped.map(function(line) {
-      return line.replace(/^\.\.\.+ /, '');
-    });
-    wrappedMessage = '> ' + cleanWrapped.join('\n  '); // Simple indent for continuation
+    // User messages - no wrapping
+    wrappedMessage = newMessage;
   } else if (newMessage.includes('┌─ ASSISTANT')) {
     // Fix box format for assistant messages (remove right border if present)
     wrappedMessage = fixAssistantBoxFormat(newMessage);
@@ -1787,28 +1763,7 @@ function parseToolBlocks(text) {
       }
     }
     
-    // Join continuation lines (lines starting with "... ")
-    const joinedLines = [];
-    let currentLine = '';
-    
-    for (let i = 0; i < cleanedLines.length; i++) {
-      const line = cleanedLines[i];
-      if (line.startsWith('... ')) {
-        // Continuation line - append to current line
-        currentLine += line.slice(4); // Remove "... " prefix
-      } else {
-        // New line - save previous and start new
-        if (currentLine) {
-          joinedLines.push(currentLine);
-        }
-        currentLine = line;
-      }
-    }
-    if (currentLine) {
-      joinedLines.push(currentLine);
-    }
-    
-    content = joinedLines.join('\n');
+    content = cleanedLines.join('\n');
   }
   
   // Match tool patterns: [TOOLNAME] args on one line, then content until next tool or END tag
@@ -2147,6 +2102,19 @@ async function searchFilesByContent(folder, regex) {
   const pattern = new RegExp(regex, 'gm');
   const results = [];
   
+  // Binary extensions to skip
+  const binaryExtensions = [
+    '.jar', '.ear', '.war', '.zip', '.tar', '.gz', '.7z', '.rar',
+    '.exe', '.dll', '.so', '.dylib', '.lib', '.a', '.o',
+    '.class', '.pyc', '.pyo', '.beam', '.elc',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.webp',
+    '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm',
+    '.ttf', '.otf', '.woff', '.woff2', '.eot',
+    '.db', '.sqlite', '.sqlite3',
+    '.min.js', '.min.css'
+  ];
+  
   async function searchDir(dir) {
     try {
       const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -2158,6 +2126,12 @@ async function searchFilesByContent(folder, regex) {
         if (entry.isDirectory()) {
           await searchDir(fullPath);
         } else {
+          // Skip binary files
+          const ext = path.extname(entry.name).toLowerCase();
+          if (binaryExtensions.includes(ext)) {
+            continue;
+          }
+          
           try {
             const content = await fs.readFile(fullPath, 'utf8');
             const lines = content.split('\n');
@@ -2436,46 +2410,18 @@ function getCodebasePath(relativePath) {
 }
 
 function wrapText(text, maxWidth) {
-  if (!maxWidth) maxWidth = 68;  // Default to 68 chars for content
-  const words = text.split(' ');
-  const lines = [];
-  let currentLine = '';
-  
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i];
-    if (currentLine.length + word.length + 1 > maxWidth) {
-      lines.push(currentLine);
-      currentLine = '... ' + word;
-    } else {
-      currentLine += (currentLine ? ' ' : '') + word;
-    }
-  }
-  
-  if (currentLine) lines.push(currentLine);
-  return lines;
+  // No wrapping - just return the text as is
+  return [text];
 }
 
 function formatInBox(content, width) {
-  if (!width) width = 70;
   const lines = content.split('\n');
-  const wrappedLines = [];
-  
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.length <= width - 2) { // Account for "│ " prefix only
-      wrappedLines.push(line);
-    } else {
-      // Wrap long lines
-      const wrapped = wrapText(line, width - 2);
-      wrappedLines.push(...wrapped);
-    }
-  }
   
   // Build box
   let result = '┌─ ASSISTANT ─────────────────────────────────────────────────────────\n';
   
-  for (let i = 0; i < wrappedLines.length; i++) {
-    const line = wrappedLines[i];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     result += '│ ' + line + '\n';
   }
   
@@ -2484,20 +2430,8 @@ function formatInBox(content, width) {
 }
 
 function wrapSystemMessage(content) {
-  const lines = content.split('\n');
-  const wrapped = [];
-  
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.length <= 70) {
-      wrapped.push(line);
-    } else {
-      const wrappedLine = wrapText(line, 70);
-      wrapped.push(...wrappedLine);
-    }
-  }
-  
-  return wrapped.join('\n');
+  // No wrapping - just return content as is
+  return content;
 }
 
 function fixBoxPadding(text) {
@@ -2592,22 +2526,10 @@ function formatTemporaryBlock(title, content, blockNumber = null, totalBlocks = 
   const headerPadding = boxWidth - headerText.length - 2;
   result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═╗\n';
   
-  // Add content lines
+  // Add content lines without wrapping
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const maxContentWidth = boxWidth - 4;
-    
-    if (line.length <= maxContentWidth) {
-      result += '║ ' + line + ' '.repeat(maxContentWidth - line.length) + ' ║\n';
-    } else {
-      // Handle long lines by breaking them
-      let remaining = line;
-      while (remaining.length > 0) {
-        const chunk = remaining.substring(0, maxContentWidth);
-        remaining = remaining.substring(maxContentWidth);
-        result += '║ ' + chunk + ' '.repeat(Math.max(0, maxContentWidth - chunk.length)) + ' ║\n';
-      }
-    }
+    result += '║ ' + line + ' '.repeat(Math.max(0, boxWidth - 4 - line.length)) + ' ║\n';
   }
   
   // Close the box
@@ -2676,8 +2598,6 @@ You are an AI development assistant helping with requirements analysis and code 
 2) Write "┌─ ASSISTANT ─────────────────────────────────────────────────────────" to your output
 3) Write your response
   - Start each line with "│ "
-  - Put your response into 68 character lines (content only)
-  - For wrapping, show by starting the continuation line with "... "
 4) Write "└─────────────────────────────────────────────────────────────────────" to end your output
 
 ## CRITICAL: MESSAGE FORMAT
@@ -2687,19 +2607,17 @@ You are an AI development assistant helping with requirements analysis and code 
 \`\`\`
 ┌─ ASSISTANT ─────────────────────────────────────────────────────────
 │ [MESSAGE]
-│ Your message content here, wrapped at 68 characters for
-│ ... readability. Long lines will automatically wrap with "..."
+│ Your message content here
 │ 
 │ [READ_CODE] .
 │ Getting project overview
 │ 
-│ [SEARCH_NAME] .*very-long-pattern-that-exceeds-width.*$ src/folder
-│ ... /with/very/long/path
-│ Searching for files with extremely long regex patterns
+│ [SEARCH_NAME] .*pattern.*$ src/folder
+│ Searching for files with regex patterns
 └─────────────────────────────────────────────────────────────────────
 \`\`\`
 
-**IMPORTANT: Start each line with "│ ". Use "..." at the start of wrapped lines.**
+**IMPORTANT: Start each line with "│ ".**
 
 ## RESPONSE TYPE RULES
 
@@ -3011,7 +2929,6 @@ Found Express.js authentication setup with session management
 
 - **Box format**: Content lines start with "│ "
 - **Complete the box**: Always close your response with the bottom border
-- **Wrap long lines**: Use "..." at the start of continuation lines
 - **Strict type separation**: Use only READ tools or only WRITE tools per response
 - **Always include [MESSAGE]**: In WRITE responses, start with [MESSAGE] for any text
 - **Use positional parameters**: Tools now use positions, not named parameters
