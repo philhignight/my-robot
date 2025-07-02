@@ -209,6 +209,39 @@ const fs = require('fs').promises;
 const path = require('path');
 const utils = require('./utils');
 
+// Helper function to format system output with visual styling
+function formatSystemOutput(content, title, chunkSize = 50) {
+  const lines = content.split('\n');
+  let result = [];
+  
+  for (let i = 0; i < lines.length; i += chunkSize) {
+    const isFirst = i === 0;
+    const chunk = lines.slice(i, Math.min(i + chunkSize, lines.length));
+    
+    // Header
+    if (isFirst) {
+      const header = `SYSTEM: ${title}`;
+      result.push(`  ╔═ ${header} ${'═'.repeat(Math.max(0, 65 - header.length)}`);
+    } else {
+      const continueHeader = `SYSTEM: Continuing ${title} (lines ${i+1}-${Math.min(i+chunkSize, lines.length)})`;
+      result.push(`  ╠═ ${continueHeader} ${'═'.repeat(Math.max(0, 65 - continueHeader.length)}`);
+    }
+    
+    // Content lines
+    chunk.forEach((line, idx) => {
+      const lineNum = i + idx + 1;
+      // Ensure consistent spacing for line numbers
+      const formattedLine = lineNum < 10 ? `  ║ ${lineNum}:  ${line}` :
+                           lineNum < 100 ? `  ║ ${lineNum}: ${line}` :
+                           `  ║ ${lineNum}: ${line}`;
+      result.push(formattedLine);
+    });
+  }
+  
+  result.push(`  ╚${'═'.repeat(68)}`);
+  return result.join('\n');
+}
+
 async function processResponse() {
   try {
     const responseText = await utils.readFileIfExists('ai-response.md');
@@ -225,7 +258,7 @@ async function processResponse() {
       utils.validateMessageFormat(responseText);
     } catch (formatError) {
       if (formatError.message.includes('complete ASCII box') && !responseText.includes('┌─ ASSISTANT')) {
-        // Missing box entirely
+        // Missing box entirely - don't add to conversation
         console.error('❌ Format Error:', formatError.message);
         await handleFormatError(formatError.message);
         return;
@@ -266,23 +299,39 @@ async function processResponse() {
 }
 
 async function handleResponseTypeError(errorMessage, responseText) {
-  // Add the invalid response to conversation, ensuring it's properly formatted
-  let cleanResponse;
+  // If response has box format, add it to conversation
   if (responseText.includes('┌─ ASSISTANT')) {
     // Already has box format - fix padding if needed
-    cleanResponse = utils.fixBoxPadding(responseText);
-  } else {
-    // No box format - add it
-    cleanResponse = utils.formatInBox(responseText, 70);
+    const cleanResponse = utils.fixBoxPadding(responseText);
+    await updateConversation(cleanResponse);
   }
-  await updateConversation(cleanResponse);
+  // Otherwise, don't add to conversation - describe the error instead
   
-  const errorResponse = 'SYSTEM: ERROR - ' + errorMessage + '\n\n' +
-    'Response Rules:\n' +
-    '1. READ Response: Use ONLY [READ], [SEARCH_NAME], [SEARCH_CONTENT]\n' +
-    '2. WRITE Response: Use [MESSAGE] for text and/or action tools\n' +
-    '3. Wrap response in ┌─ ASSISTANT ─┐ box\n\n' +
-    'Your last response violated these rules. Please try again.';
+  const errorContent = responseText.includes('┌─ ASSISTANT') ? 
+    `ERROR - ${errorMessage}
+
+Response Rules:
+1. READ Response: Use ONLY [READ], [SEARCH_NAME], [SEARCH_CONTENT]
+2. WRITE Response: Use [MESSAGE] for text and/or action tools
+3. Wrap response in ┌─ ASSISTANT ─┐ box
+
+Your last response violated these rules. Please try again.` :
+    `ERROR - ${errorMessage}
+
+Response Rules:
+1. READ Response: Use ONLY [READ], [SEARCH_NAME], [SEARCH_CONTENT]
+2. WRITE Response: Use [MESSAGE] for text and/or action tools
+3. Wrap response in ┌─ ASSISTANT ─┐ box
+
+Your response was missing the required ASCII box format. Here's what you wrote:
+
+--- START OF YOUR INVALID RESPONSE ---
+${responseText}
+--- END OF YOUR INVALID RESPONSE ---
+
+Please reformat this response with the proper ASCII box.`;
+  
+  const errorResponse = formatSystemOutput(errorContent, 'Response Type Error', 50);
   
   await updateConversation(errorResponse);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -302,9 +351,29 @@ async function handleReadResponse(responseText, tools) {
     const tool = tools[i];
     const result = await executeTool(tool);
     
-    // Add tool result to conversation
-    const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-    await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + resultText);
+    // Format tool result with visual styling
+    let formattedResult;
+    if (tool.name === 'READ' && result.includes('Content of ')) {
+      // Extract filename and content for READ operations
+      const lines = result.split('\n');
+      const header = lines[0]; // "Content of filename:"
+      const content = lines.slice(1).join('\n');
+      const filename = header.replace('Content of ', '').replace(':', '');
+      formattedResult = formatSystemOutput(content, `READ result: ${filename}`);
+    } else if (tool.name === 'READ' && result.includes('Contents of ')) {
+      // Directory listing
+      const lines = result.split('\n');
+      const header = lines[0]; // "Contents of dir:"
+      const content = lines.slice(1).join('\n');
+      const dirname = header.replace('Contents of ', '').replace(':', '');
+      formattedResult = formatSystemOutput(content, `READ result: ${dirname} directory listing`);
+    } else if (tool.name === 'SEARCH_NAME' || tool.name === 'SEARCH_CONTENT') {
+      formattedResult = formatSystemOutput(result, `${tool.name} results`);
+    } else {
+      formattedResult = formatSystemOutput(result, `${tool.name} result`);
+    }
+    
+    await updateConversation(formattedResult);
   }
   
   // Clear response and build next prompt
@@ -357,7 +426,8 @@ async function handleWriteResponse(responseText, tools) {
     
     // Add tool result to conversation
     const resultText = typeof result === 'string' ? result : JSON.stringify(result);
-    await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + resultText);
+    const formattedResult = formatSystemOutput(resultText, `${tool.name} result`, 30);
+    await updateConversation(formattedResult);
   }
   
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -369,14 +439,22 @@ async function handleWriteResponse(responseText, tools) {
 async function handleFormatError(errorMessage) {
   const responseText = await utils.readFileIfExists('ai-response.md');
   
-  // Parse tools and clean the response
-  const tools = utils.parseToolBlocks(responseText);
-  const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
-  
-  // Add the malformed response to conversation so AI can see what went wrong
-  await updateConversation(cleanResponse);
-  
-  const errorResponse = 'SYSTEM: ERROR - ' + errorMessage + '\n\nPlease fix your response format. Remember to wrap in ┌─ ASSISTANT ─┐ box.';
+  // Don't add malformed response to conversation
+  // Instead, show the entire response in the error message
+  const errorContent = `ERROR - ${errorMessage}
+
+Your response was:
+
+--- START OF YOUR INVALID RESPONSE ---
+${responseText}
+--- END OF YOUR INVALID RESPONSE ---
+
+Please fix your response format. Remember to:
+1. Start with: ┌─ ASSISTANT ─────────────────────────────────────────────────────────┐
+2. Wrap each line with │ ... │
+3. End with: └─────────────────────────────────────────────────────────────────────┘`;
+
+  const errorResponse = formatSystemOutput(errorContent, 'Format Error', 50);
   
   await updateConversation(errorResponse);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -396,7 +474,8 @@ async function handleIncompleteMessage(responseText) {
   
   // Get the last 100 characters to show context
   const lastPart = responseText.slice(-100);
-  const continuationRequest = 'SYSTEM: Your message was cut off. Please continue from: "' + lastPart + '"';
+  const continuationContent = `Your message was cut off. Please continue from: "${lastPart}"`;
+  const continuationRequest = formatSystemOutput(continuationContent, 'Incomplete Message', 50);
   
   await updateConversation(continuationRequest);
   await fs.writeFile('ai-response.md', '', 'utf8');
@@ -768,7 +847,8 @@ async function executeDeleteFile(params) {
 
 async function requestFileConfirmation(tool, result) {
   if (typeof result === 'string') {
-    await updateConversation('SYSTEM: Tool result (' + tool.name + ')\n' + result);
+    const formattedResult = formatSystemOutput(result, `${tool.name} error`, 30);
+    await updateConversation(formattedResult);
     return;
   }
   
@@ -814,7 +894,18 @@ async function requestFileConfirmation(tool, result) {
     modifiedPreview.push((previewStart + i + 1) + ': ' + modifiedSlice[i]);
   }
   
-  const confirmation = 'SYSTEM: PENDING UPDATE for ' + tool.params.file_name + '\nDESCRIPTION: ' + description + '\n\nORIGINAL CODE (lines ' + (previewStart + 1) + '-' + (originalEnd + 1) + '):\n' + originalPreview.join('\n') + '\n\nNEW CODE (lines ' + (previewStart + 1) + '-' + (previewEnd + 1) + '):\n' + modifiedPreview.join('\n') + '\n\nReply with [COMMIT] to apply changes.';
+  const confirmation = `PENDING UPDATE for ${tool.params.file_name}
+DESCRIPTION: ${description}
+
+ORIGINAL CODE (lines ${previewStart + 1}-${originalEnd + 1}):
+${originalPreview.join('\n')}
+
+NEW CODE (lines ${previewStart + 1}-${previewEnd + 1}):
+${modifiedPreview.join('\n')}
+
+Reply with [COMMIT] to apply changes.`;
+  
+  const formattedConfirmation = formatSystemOutput(confirmation, 'File Update Preview', 40);
   
   const pendingData = {
     file: tool.params.file_name,
@@ -827,7 +918,7 @@ async function requestFileConfirmation(tool, result) {
   
   await fs.writeFile('pending-changes.json', JSON.stringify(pendingData, null, 2), 'utf8');
   
-  await updateConversation(confirmation);
+  await updateConversation(formattedConfirmation);
   await fs.writeFile('ai-response.md', '', 'utf8');
   
   const buildPrompt = require('./message-to-prompt').buildPrompt;
@@ -863,7 +954,8 @@ async function handlePendingUpdate(responseText) {
     
     await gitCommitAndPush(pendingData.file, pendingData.description);
     
-    await updateConversation('SYSTEM: Changes committed to ' + pendingData.file + ' and pushed to git');
+    const successMsg = formatSystemOutput(`Changes committed to ${pendingData.file} and pushed to git`, 'Git Status', 30);
+    await updateConversation(successMsg);
     await fs.writeFile('ai-response.md', '', 'utf8');
     
     const buildPrompt = require('./message-to-prompt').buildPrompt;
@@ -887,7 +979,8 @@ async function handlePendingUpdate(responseText) {
         return;
       }
     } else {
-      await updateConversation('SYSTEM: Invalid response. Please use [COMMIT] to apply changes.');
+    const formattedResult = formatSystemOutput(`Invalid response. Please use [COMMIT] to apply changes.`, 'Error', 30);
+    await updateConversation(formattedResult);
       
       const buildPrompt = require('./message-to-prompt').buildPrompt;
       await buildPrompt();
@@ -906,8 +999,13 @@ async function updateConversation(newMessage) {
   
   // Apply wrapping based on message type
   let wrappedMessage = newMessage;
-  if (newMessage.startsWith('SYSTEM:')) {
-    // Wrap system messages without continuation markers
+  
+  // Check if it's a formatted system message (starts with box drawing)
+  if (newMessage.trim().startsWith('╔═') || newMessage.trim().startsWith('╠═') || newMessage.trim().startsWith('║') || newMessage.trim().startsWith('╚')) {
+    // Don't wrap formatted system messages - they're already formatted
+    wrappedMessage = newMessage;
+  } else if (newMessage.startsWith('SYSTEM:')) {
+    // Wrap old-style system messages without continuation markers
     const lines = newMessage.split('\n');
     const wrappedLines = [];
     
