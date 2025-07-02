@@ -1,90 +1,4 @@
-async function buildPrompt() {
-  try {
-    await utils.ensureDir('ai-managed');
-    
-    const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
-    const goals = await utils.readFileIfExists('goals.md');
-    const context = await utils.readFileIfExists('ai-managed/context.md');
-    const conversation = await utils.readFileIfExists('conversation.md');
-    const basePrompt = await utils.readFileIfExists('prompts/base.md');
-    const modePrompt = await utils.readFileIfExists('prompts/' + mode + '.md');
-    
-    // Generate 2-level directory listing
-    const listTool = {
-      name: 'LIST',
-      params: { path: '.', maxDepth: 2 }
-    };
-    const projectStructure = await executeTwoLevelList(listTool.params);
-    
-    // Extract just the conversation history
-    const lines = conversation.split('\n');
-    const historyIndex = lines.findIndex(function(line) { return line.includes('=== CONVERSATION HISTORY ==='); });
-    const waitingIndex = lines.findIndex(function(line) { return line.includes('=== WAITING FOR YOUR MESSAGE ==='); });
-    
-    let conversationHistory = '';
-    if (historyIndex !== -1) {
-      // Only get content between history marker and waiting marker
-      if (waitingIndex > historyIndex) {
-        conversationHistory = lines.slice(historyIndex + 1, waitingIndex).join('\n').trim();
-      } else {
-        conversationHistory = lines.slice(historyIndex + 1).join('\n').trim();
-      }
-      
-      // Remove any "=== AI RESPONSE READY ===" lines that might have been left
-      conversationHistory = conversationHistory.split('\n')
-        .filter(function(line) { 
-          return !line.includes('=== AI RESPONSE READY ===') && 
-                 !line.includes('Copy the contents of generated-prompt.md');
-        })
-        .join('\n');
-    }
-    
-    // Check if we need to compact the conversation
-    const estimatedLength = utils.calculatePromptLength(basePrompt, modePrompt, goals, context, conversationHistory);
-    
-    if (estimatedLength > 500000 && conversationHistory.length > 10000) {
-      console.log('📝 Compacting conversation history...');
-      conversationHistory = utils.compactConversation(conversationHistory, 30000);
-      console.log('✓ Conversation compacted');
-    }
-    
-    // Build prompt with conditional sections
-    let prompt = basePrompt + '\n\n' + modePrompt;
-    
-    // Only include goals if it has meaningful content
-    if (goals.trim() && goals.trim() !== '# Project Goals\n\nAdd your high-level objectives here') {
-      prompt += '\n\nGOALS:\n' + goals;
-    }
-    
-    // Add project structure to context
-    let fullContext = 'PROJECT STRUCTURE (2 levels):\n' + projectStructure;
-    if (context.trim()) {
-      fullContext += '\n\nADDITIONAL CONTEXT:\n' + context;
-    }
-    prompt += '\n\nCONTEXT:\n' + fullContext;
-    
-    // Only include conversation if there's history
-    if (conversationHistory) {
-      prompt += '\n\nCONVERSATION HISTORY:\n' + conversationHistory;
-    }
-    
-    // Add instruction for AI to respond
-    prompt += '\n\nGenerate your response as the assistant.';
-    
-    await fs.writeFile('generated-prompt.md', prompt, 'utf8');
-    console.log('✓ Built prompt for ' + mode + ' mode');
-    
-    if (prompt.length > 500000) {
-      console.log('⚠ Warning: Prompt is ' + prompt.length + ' chars, approaching 600k limit');
-      if (prompt.length > 550000) {
-        console.log('⚠ Consider running "npm run reset" if prompt becomes too large');
-      }
-    }
-    
-  } catch (err) {
-    console.error('Error building prompt:', err);
-  }
-}// utils.js
+// utils.js
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -830,10 +744,10 @@ function fixBoxPadding(text) {
       // Bottom border
       fixedLines.push('└' + '─'.repeat(68) + '┘');
     } else if (line.startsWith('│')) {
-      // Content line - ensure proper padding
+      // Content line - ensure proper padding (66 chars for content + 4 for borders = 70)
       const content = line.substring(1).replace(/\s*│\s*$/, '');
-      const paddedContent = content + ' '.repeat(Math.max(0, 68 - content.length));
-      fixedLines.push('│' + paddedContent + ' │');
+      const paddedContent = content + ' '.repeat(Math.max(0, 66 - content.length));
+      fixedLines.push('│ ' + paddedContent + ' │');
     } else {
       fixedLines.push(line);
     }
@@ -875,6 +789,78 @@ module.exports = {
 const fs = require('fs').promises;
 const utils = require('./utils');
 
+async function executeTwoLevelList(params) {
+  try {
+    const dirPath = utils.getCodebasePath(params.path || '.');
+    
+    async function buildTree(dir, prefix, depth, maxDepth) {
+      if (depth > maxDepth) return '';
+      
+      let result = '';
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      
+      // Separate and sort directories and files
+      const dirs = [];
+      const files = [];
+      
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.name.startsWith('.')) continue;
+        
+        if (entry.isDirectory()) {
+          dirs.push(entry.name);
+        } else {
+          files.push(entry.name);
+        }
+      }
+      
+      dirs.sort();
+      files.sort();
+      
+      // Process directories
+      for (let i = 0; i < dirs.length; i++) {
+        const dirName = dirs[i];
+        const isLast = (i === dirs.length - 1 && files.length === 0);
+        const subPath = require('path').join(dir, dirName);
+        
+        result += prefix + (isLast ? '└── ' : '├── ') + dirName + '/\n';
+        
+        // Recursively build subtree
+        if (depth < maxDepth) {
+          const subTree = await buildTree(subPath, prefix + (isLast ? '    ' : '│   '), depth + 1, maxDepth);
+          result += subTree;
+        }
+      }
+      
+      // Process files
+      for (let i = 0; i < files.length; i++) {
+        const fileName = files[i];
+        const isLast = (i === files.length - 1);
+        const filePath = require('path').join(dir, fileName);
+        const lineCount = await utils.getLineCount(filePath);
+        
+        result += prefix + (isLast ? '└── ' : '├── ') + fileName + ' (' + lineCount + ' lines)\n';
+      }
+      
+      return result;
+    }
+    
+    const rootName = params.path || '.';
+    let result = 'Contents of ' + rootName + ':\n';
+    
+    const tree = await buildTree(dirPath, '', 0, 2);
+    if (tree) {
+      result += tree;
+    } else {
+      result += '[Empty directory]';
+    }
+    
+    return result;
+  } catch (err) {
+    return 'Error listing directory: ' + err.message;
+  }
+}
+
 async function buildPrompt() {
   try {
     await utils.ensureDir('ai-managed');
@@ -885,6 +871,13 @@ async function buildPrompt() {
     const conversation = await utils.readFileIfExists('conversation.md');
     const basePrompt = await utils.readFileIfExists('prompts/base.md');
     const modePrompt = await utils.readFileIfExists('prompts/' + mode + '.md');
+    
+    // Generate 2-level directory listing
+    const listTool = {
+      name: 'LIST',
+      params: { path: '.', maxDepth: 2 }
+    };
+    const projectStructure = await executeTwoLevelList(listTool.params);
     
     // Extract just the conversation history
     const lines = conversation.split('\n');
@@ -919,11 +912,25 @@ async function buildPrompt() {
     }
     
     // Build prompt with conditional sections
-    let prompt = basePrompt + '\n\n' + modePrompt + '\n\nGOALS:\n' + goals;
+    let prompt = basePrompt + '\n\n' + modePrompt;
     
-    // Only include context if it has content
+    // Only include goals if it has meaningful content
+    if (goals.trim() && goals.trim() !== '# Project Goals\n\nAdd your high-level objectives here') {
+      prompt += '\n\nGOALS:\n' + goals.trim();
+    }
+    
+    // Build context section with project structure
+    let contextSection = '';
     if (context.trim()) {
-      prompt += '\n\nCONTEXT:\n' + context;
+      contextSection = 'PROJECT STRUCTURE (2 levels):\n' + projectStructure + '\n\nADDITIONAL CONTEXT:\n' + context.trim();
+    } else {
+      // Only project structure, no CONTEXT header
+      contextSection = 'PROJECT STRUCTURE (2 levels):\n' + projectStructure;
+    }
+    
+    // Add context section with proper spacing
+    if (contextSection) {
+      prompt += '\n\n' + contextSection;
     }
     
     // Only include conversation if there's history
@@ -949,79 +956,7 @@ async function buildPrompt() {
   }
 }
 
-async function executeTwoLevelList(params) {
-  try {
-    const dirPath = utils.getCodebasePath(params.path || '.');
-    
-    async function buildTree(dir, prefix, depth, maxDepth) {
-      if (depth > maxDepth) return '';
-      
-      let result = '';
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      
-      // Separate and sort directories and files
-      const dirs = [];
-      const files = [];
-      
-      for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        if (entry.name.startsWith('.')) continue;
-        
-        if (entry.isDirectory()) {
-          dirs.push(entry.name);
-        } else {
-          files.push(entry.name);
-        }
-      }
-      
-      dirs.sort();
-      files.sort();
-      
-      // Process directories
-      for (let i = 0; i < dirs.length; i++) {
-        const dirName = dirs[i];
-        const isLast = (i === dirs.length - 1 && files.length === 0);
-        const subPath = path.join(dir, dirName);
-        
-        result += prefix + (isLast ? '└── ' : '├── ') + dirName + '/\n';
-        
-        // Recursively build subtree
-        if (depth < maxDepth) {
-          const subTree = await buildTree(subPath, prefix + (isLast ? '    ' : '│   '), depth + 1, maxDepth);
-          result += subTree;
-        }
-      }
-      
-      // Process files
-      for (let i = 0; i < files.length; i++) {
-        const fileName = files[i];
-        const isLast = (i === files.length - 1);
-        const filePath = path.join(dir, fileName);
-        const lineCount = await utils.getLineCount(filePath);
-        
-        result += prefix + (isLast ? '└── ' : '├── ') + fileName + ' (' + lineCount + ' lines)\n';
-      }
-      
-      return result;
-    }
-    
-    const rootName = params.path || '.';
-    let result = 'Contents of ' + rootName + ':\n';
-    
-    const tree = await buildTree(dirPath, '', 0, 2);
-    if (tree) {
-      result += tree;
-    } else {
-      result += '[Empty directory]';
-    }
-    
-    return result;
-  } catch (err) {
-    return 'Error listing directory: ' + err.message;
-  }
-}
-
-module.exports = { buildPrompt: buildPrompt, executeTwoLevelList: executeTwoLevelList };
+module.exports = { buildPrompt: buildPrompt };
 
 // ==========================================
 
@@ -1533,19 +1468,31 @@ async function requestFileConfirmation(tool, result) {
   const originalLines = originalContent.split('\n');
   const modifiedLines = modifiedContent.split('\n');
   
-  let changeStart = 0;
-  for (let i = 0; i < Math.min(originalLines.length, modifiedLines.length); i++) {
-    if (originalLines[i] !== modifiedLines[i]) {
-      changeStart = i;
-      break;
+  // For UPDATE operations, use the specified line range
+  let previewStart, previewEnd, originalEnd;
+  
+  if (tool.name === 'UPDATE') {
+    // Show the lines being replaced
+    previewStart = parseInt(tool.params.start_line) - 1;
+    originalEnd = parseInt(tool.params.end_line) - 1;
+    // Show some context around the change in the new content
+    previewEnd = Math.min(modifiedLines.length - 1, originalEnd + 20);
+  } else {
+    // For INSERT, find the first change
+    let changeStart = 0;
+    for (let i = 0; i < Math.min(originalLines.length, modifiedLines.length); i++) {
+      if (originalLines[i] !== modifiedLines[i]) {
+        changeStart = i;
+        break;
+      }
     }
+    previewStart = Math.max(0, changeStart - 20);
+    originalEnd = changeStart;
+    previewEnd = Math.min(modifiedLines.length - 1, changeStart + 40);
   }
   
-  const previewStart = Math.max(0, changeStart - 20);
-  const previewEnd = Math.min(modifiedLines.length - 1, changeStart + 40);
-  
   const originalPreview = [];
-  const originalSlice = originalLines.slice(previewStart, changeStart + 1);
+  const originalSlice = originalLines.slice(previewStart, originalEnd + 1);
   for (let i = 0; i < originalSlice.length; i++) {
     originalPreview.push((previewStart + i + 1) + ': ' + originalSlice[i]);
   }
@@ -1556,7 +1503,7 @@ async function requestFileConfirmation(tool, result) {
     modifiedPreview.push((previewStart + i + 1) + ': ' + modifiedSlice[i]);
   }
   
-  const confirmation = 'SYSTEM: PENDING UPDATE for ' + tool.params.file_name + '\nDESCRIPTION: ' + description + '\n\nORIGINAL CODE (lines ' + (previewStart + 1) + '-' + (changeStart + 1) + '):\n' + originalPreview.join('\n') + '\n\nNEW CODE (lines ' + (previewStart + 1) + '-' + (previewEnd + 1) + '):\n' + modifiedPreview.join('\n') + '\n\nReply with [COMMIT] to apply changes.';
+  const confirmation = 'SYSTEM: PENDING UPDATE for ' + tool.params.file_name + '\nDESCRIPTION: ' + description + '\n\nORIGINAL CODE (lines ' + (previewStart + 1) + '-' + (originalEnd + 1) + '):\n' + originalPreview.join('\n') + '\n\nNEW CODE (lines ' + (previewStart + 1) + '-' + (previewEnd + 1) + '):\n' + modifiedPreview.join('\n') + '\n\nReply with [COMMIT] to apply changes.';
   
   const pendingData = {
     file: tool.params.file_name,
