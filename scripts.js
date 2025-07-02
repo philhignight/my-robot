@@ -1501,8 +1501,12 @@ async function buildExtractionPrompt(tempBlock) {
   try {
     console.log('✓ Building extraction prompt for: ' + tempBlock.title);
     
-    // Count total temporary blocks
+    // Get current context
+    const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
+    const goals = await utils.readFileIfExists('goals.md');
     const conversation = await utils.readFileIfExists('conversation.md');
+    
+    // Count total temporary blocks
     const allTempBlocks = [];
     const lines = conversation.split('\n');
     let currentSearchLine = 0;
@@ -1539,13 +1543,6 @@ async function buildExtractionPrompt(tempBlock) {
         isCode = false;
       }
     }
-    
-    // Get current context
-    const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
-    const goals = await utils.readFileIfExists('goals.md');
-    const context = await utils.readFileIfExists('ai-managed/context.md');
-    const discoveries = await utils.readFileIfExists('ai-managed/discoveries.md');
-    const conversation = await utils.readFileIfExists('conversation.md');
     
     // Build the extraction prompt
     let prompt = `# Data Extraction Task (Block ${blockNumber} of ${totalBlocks})
