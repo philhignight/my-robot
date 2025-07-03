@@ -249,7 +249,7 @@ async function buildPrompt(extractionMode = false) {
     const allocation = allocatePromptBudget(inputs, mode, new Date());
 
     // Build final prompt from allocations
-    const prompt = buildPromptFromAllocations(allocation.allocations, mode);
+    let prompt = buildPromptFromAllocations(allocation.allocations, mode);
 
     // Normalize multiple newlines to single newline
     prompt = prompt.replace(/\n{2,}/g, "\n");
