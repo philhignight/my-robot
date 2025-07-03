@@ -252,6 +252,9 @@ async function buildPrompt(extractionMode = false) {
     // Build final prompt from allocations
     const prompt = buildPromptFromAllocations(allocation.allocations, mode);
 
+    // Normalize multiple newlines to single newline
+    prompt = prompt.replace(/\n{2,}/g, "\n");
+
     await fs.writeFile("generated-prompt.md", prompt, "utf8");
 
     console.log("✓ Built prompt for " + mode + " mode");
@@ -415,7 +418,7 @@ MODE: ${mode}
       prompt += "GOALS:\n" + goals.trim() + "\n\n";
     }
 
-    // Add recent conversation context (last 3 exchanges) - EXCLUDE temporary blocks
+    // Add recent conversation context (last 5 exchanges) - EXCLUDE temporary blocks but KEEP summaries
     const conversationLines = conversation.split("\n");
     const exchanges = [];
     let currentExchange = [];
@@ -433,25 +436,30 @@ MODE: ${mode}
         continue;
       }
 
-      // Track temporary block state (skip these entirely)
-      if (line.includes("╚═")) {
-        inTempBlock = true;
-        continue;
+      // Track temporary block state - skip content but not the line itself
+      if (line.includes("╚═") && !line.includes("╚═══")) {
+        // Single line closing
+        if (inTempBlock) {
+          inTempBlock = false;
+          continue;
+        }
       }
       if (line.includes("╔═ TEMPORARY:")) {
-        inTempBlock = false;
+        inTempBlock = true;
         continue;
       }
       if (inTempBlock) {
         continue;
       }
 
-      if (line.startsWith("> ") && !inAssistantBox) {
-        if (currentExchange.length > 0) {
-          exchanges.push(currentExchange.reverse().join("\n"));
-          currentExchange = [];
-          if (exchanges.length >= 3) break;
-        }
+      if (
+        line.startsWith("> ") &&
+        !inAssistantBox &&
+        currentExchange.length > 0
+      ) {
+        exchanges.push(currentExchange.reverse().join("\n"));
+        currentExchange = [];
+        if (exchanges.length >= 5) break; // Get more context
       }
 
       currentExchange.push(line);
@@ -585,6 +593,9 @@ Focus on your current ${mode} mode objectives, not comprehensive coverage.
 
 Extract the relevant information now. Write your analysis as plain text.`;
 
+    // Normalize multiple newlines to single newline
+    prompt = prompt.replace(/\n{2,}/g, "\n");
+
     await fs.writeFile("generated-prompt.md", prompt, "utf8");
     console.log(
       "✓ Extraction prompt ready in generated-prompt.md (block " +
@@ -702,14 +713,6 @@ async function handleExtractionResponse(responseText, tempBlock) {
       extractedContent = "[No relevant information found]";
     }
 
-    // Remove the temporary block from conversation
-    const conversation = await utils.readFileIfExists("conversation.md");
-    const cleanedConversation = utils.removeTemporaryBlock(
-      conversation,
-      tempBlock.startLine,
-      tempBlock.endLine
-    );
-
     // Create permanent summary block
     let summaryTitle = tempBlock.title.replace("TEMPORARY: ", "");
     // For multi-file blocks, improve the summary title
@@ -722,32 +725,20 @@ async function handleExtractionResponse(responseText, tempBlock) {
       "SYSTEM: Read summary of " + summaryTitle + "\n" + extractedContent
     );
 
-    // Update conversation with cleaned version + summary
-    const lines = cleanedConversation.split("\n");
-    const historyIndex = lines.findIndex((line) =>
-      line.includes("=== CONVERSATION HISTORY ===")
-    );
-    const waitingIndex = lines.findIndex((line) =>
-      line.includes("=== WAITING FOR YOUR MESSAGE ===")
-    );
+    // Replace the temporary block with summary in place
+    const conversation = await utils.readFileIfExists("conversation.md");
+    const lines = conversation.split("\n");
 
-    let historyContent = "";
-    if (historyIndex !== -1 && waitingIndex > historyIndex) {
-      historyContent = lines
-        .slice(historyIndex + 1, waitingIndex)
-        .join("\n")
-        .trim();
-    }
+    // Replace the temporary block lines with the summary
+    const before = lines.slice(0, tempBlock.startLine);
+    const after = lines.slice(tempBlock.endLine + 1);
+    const summaryLines = summaryBlock.split("\n");
 
-    const newHistory =
-      historyContent + (historyContent ? "\n\n" : "") + summaryBlock;
-    const updated =
-      "=== CONVERSATION HISTORY ===\n\n" +
-      newHistory +
-      "\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]";
+    const updatedLines = before.concat(summaryLines).concat(after);
+    const updated = updatedLines.join("\n");
 
     await fs.writeFile("conversation.md", updated, "utf8");
-    console.log("✓ Extraction complete, summary added to conversation");
+    console.log("✓ Extraction complete, summary replaced temporary block");
 
     // Clear response and build next prompt
     await fs.writeFile("ai-response.md", "", "utf8");
@@ -1998,6 +1989,9 @@ async function updateConversation(newMessage) {
     wrappedMessage = fixAssistantBoxFormat(newMessage);
   } else if (newMessage.includes("╔═ TEMPORARY:")) {
     // Temporary blocks are already formatted
+    wrappedMessage = newMessage;
+  } else if (newMessage.includes("╔═ SYSTEM:")) {
+    // System blocks are already formatted - don't double-wrap
     wrappedMessage = newMessage;
   }
 
