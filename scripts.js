@@ -296,58 +296,97 @@ MODE: ${mode}
       prompt += 'GOALS:\n' + goals.trim() + '\n\n';
     }
     
-    // Add recent conversation context (last 5 exchanges) - EXCLUDE temporary blocks but KEEP summaries
+    // Add recent conversation context - fit as many exchanges as possible within 200K total prompt limit
     const conversationLines = conversation.split('\n');
     const exchanges = [];
     let currentExchange = [];
-    let inAssistantBox = false;
-    let inTempBlock = false;
+    const MAX_PROMPT_SIZE = 200000; // 200K character limit
+    const BUFFER_SIZE = 10000; // Leave some buffer for safety
     
+    // First pass: identify all temporary blocks
+    const tempBlocks = [];
+    for (let i = 0; i < conversationLines.length; i++) {
+      if (conversationLines[i].match(/╔═ TEMPORARY:/)) {
+        const startLine = i;
+        // Find the corresponding closing line
+        for (let j = i + 1; j < conversationLines.length; j++) {
+          if (conversationLines[j].match(/╚═+$/)) {
+            tempBlocks.push({ start: startLine, end: j });
+            i = j; // Skip to end of this block
+            break;
+          }
+        }
+      }
+    }
+    
+    // Helper to check if a line is inside a temporary block
+    const isInTempBlock = (lineIndex) => {
+      return tempBlocks.some(block => lineIndex >= block.start && lineIndex <= block.end);
+    };
+    
+    // Calculate current prompt size (without exchanges)
+    let basePromptSize = prompt.length + tempBlock.content.length + 100; // Extra for final instructions
+    
+    // Second pass: extract exchanges, skipping temporary blocks
     for (let i = conversationLines.length - 1; i >= 0; i--) {
+      // Skip if inside a temporary block
+      if (isInTempBlock(i)) continue;
+      
       const line = conversationLines[i];
       
-      // Skip the waiting message lines
+      // Skip waiting message lines
       if (line.includes('=== WAITING FOR YOUR MESSAGE ===') || 
           line === '[write here when ready]') {
         continue;
       }
       
-      // Track temporary block state - skip content but not the line itself
-      if (line.includes('╚═') && !line.includes('╚═══')) { // Single line closing
-        if (inTempBlock) {
-          inTempBlock = false;
-          continue;
+      // Check for user message start (new exchange)
+      if (line.startsWith('> ') && currentExchange.length > 0) {
+        // Complete the current exchange
+        const exchangeText = currentExchange.reverse().join('\n');
+        const exchangeSize = exchangeText.length + 2; // +2 for newlines
+        
+        // Check if adding this exchange would exceed the limit
+        const potentialSize = basePromptSize + 
+          exchanges.reduce((sum, ex) => sum + ex.length + 2, 0) + 
+          exchangeSize + 
+          20; // 'RECENT CONTEXT:\n' header
+          
+        if (potentialSize > MAX_PROMPT_SIZE - BUFFER_SIZE) {
+          // We've collected as many exchanges as will fit
+          break;
         }
-      }
-      if (line.includes('╔═ TEMPORARY:')) {
-        inTempBlock = true;
-        continue;
-      }
-      if (inTempBlock) {
-        continue;
-      }
-      
-      if (line.startsWith('> ') && !inAssistantBox && currentExchange.length > 0) {
-        exchanges.push(currentExchange.reverse().join('\n'));
-        currentExchange = [];
-        if (exchanges.length >= 5) break; // Get more context
-      }
-      
-      currentExchange.push(line);
-      
-      if (line.includes('└─') && i > 0 && conversationLines[i-1].includes('│')) {
-        inAssistantBox = true;
-      } else if (line.includes('┌─ ASSISTANT')) {
-        inAssistantBox = false;
+        
+        exchanges.push(exchangeText);
+        currentExchange = [line]; // Start new exchange with this line
+      } else {
+        // Add line to current exchange
+        currentExchange.push(line);
       }
     }
     
-    if (currentExchange.length > 0 && exchanges.length < 3) {
-      exchanges.push(currentExchange.reverse().join('\n'));
+    // Add the last exchange if it fits
+    if (currentExchange.length > 0) {
+      const exchangeText = currentExchange.reverse().join('\n');
+      const exchangeSize = exchangeText.length + 2;
+      const potentialSize = basePromptSize + 
+        exchanges.reduce((sum, ex) => sum + ex.length + 2, 0) + 
+        exchangeSize + 
+        20;
+        
+      if (potentialSize <= MAX_PROMPT_SIZE - BUFFER_SIZE) {
+        exchanges.push(exchangeText);
+      }
     }
     
+    // Add to prompt
     if (exchanges.length > 0) {
-      prompt += 'RECENT CONTEXT:\n' + exchanges.reverse().join('\n\n') + '\n\n';
+      const contextHeader = 'RECENT CONTEXT:\n';
+      const contextContent = exchanges.reverse().join('\n\n');
+      prompt += contextHeader + contextContent + '\n\n';
+      
+      // Log how many exchanges we included
+      console.log(`✓ Included ${exchanges.length} exchanges in extraction prompt`);
     }
     
     // Add extraction guidelines based on content type
@@ -1554,7 +1593,7 @@ function formatSystemToolResult(message) {
     headerText = headerText.substring(0, boxWidth - 5) + '... ';
   }
   const headerPadding = boxWidth - headerText.length - 2;
-  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═╗\n';
+  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═\n';
   
   // Process content lines
   const contentLines = lines.slice(1);
@@ -1585,10 +1624,10 @@ function formatSystemToolResult(message) {
         const shortContTitle = ' SYSTEM: ' + shortFileName + 
                               ' (lines ' + actualLineNumber + '-' + endLine + ') ';
         const contPadding = boxWidth - shortContTitle.length - 2;
-        result += '╠═' + shortContTitle + '═'.repeat(Math.max(0, contPadding)) + '═╣\n';
+        result += '╠═' + shortContTitle + '═'.repeat(Math.max(0, contPadding)) + '═\n';
       } else {
         const contPadding = boxWidth - contTitle.length - 2;
-        result += '╠═' + contTitle + '═'.repeat(Math.max(0, contPadding)) + '═╣\n';
+        result += '╠═' + contTitle + '═'.repeat(Math.max(0, contPadding)) + '═\n';
       }
     }
     
@@ -1599,7 +1638,7 @@ function formatSystemToolResult(message) {
   }
   
   // Close the box
-  result += '╚' + '═'.repeat(boxWidth - 2) + '╝';
+  result += '╚' + '═'.repeat(boxWidth - 1);
   
   return result;
 }
@@ -3539,7 +3578,7 @@ function fixBoxPadding(text) {
 // New functions for temporary block support
 function findTemporaryBlock(conversation, startFrom = 0) {
   // Look for temporary content blocks in the conversation
-  const tempStartPattern = /╔═ TEMPORARY: (.+?) ═+╗/;
+  const tempStartPattern = /╔═ TEMPORARY: (.+?) ═+$/;
   const lines = conversation.split('\n');
   
   for (let i = startFrom; i < lines.length; i++) {
@@ -3601,7 +3640,7 @@ function formatTemporaryBlock(title, content, blockNumber = null, totalBlocks = 
     headerText = headerText.substring(0, boxWidth - 5) + '... ';
   }
   const headerPadding = boxWidth - headerText.length - 2;
-  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═╗\n';
+  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═\n';
   
   // Add content lines WITHOUT padding or right border
   for (let i = 0; i < lines.length; i++) {
@@ -3610,7 +3649,7 @@ function formatTemporaryBlock(title, content, blockNumber = null, totalBlocks = 
   }
   
   // Close the box
-  result += '╚' + '═'.repeat(boxWidth - 2) + '╝';
+  result += '╚' + '═'.repeat(boxWidth - 1);
   
   return result;
 }
