@@ -211,7 +211,6 @@ async function buildExtractionPrompt(tempBlock) {
     console.log('✓ Building extraction prompt for: ' + tempBlock.title);
     
     // Get current context
-    const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
     const goals = await utils.readFileIfExists('goals.md');
     const conversation = await utils.readFileIfExists('conversation.md');
     
@@ -512,7 +511,10 @@ Extract the relevant information now. Write your analysis as plain text.`;
   }
 }
 
-module.exports = { buildPrompt: buildPrompt };
+module.exports = { 
+  buildPrompt: buildPrompt,
+  buildExtractionPrompt: buildExtractionPrompt
+};
 // ==========================================
 // process-response.js
 // process-response.js
@@ -865,9 +867,7 @@ async function handleWriteResponse(responseText, tools) {
   });
   
   const specialTools = tools.filter(function(t) {
-    return t.name === 'DISCOVERED' || t.name === 'SWITCH_TO' || 
-           t.name === 'SWITCH_TO_EXPLORATION' || t.name === 'SWITCH_TO_PLANNING' ||
-           t.name === 'SWITCH_TO_IMPLEMENTATION' ||
+    return t.name === 'DISCOVERED' || 
            t.name === 'EXPLORATION_FINDINGS' || t.name === 'DETAILED_PLAN';
   });
   
@@ -954,12 +954,6 @@ async function handleSpecialTool(tool) {
     case 'DISCOVERED':
       await handleDiscovery(tool.params);
       break;
-    case 'SWITCH_TO':
-    case 'SWITCH_TO_EXPLORATION':
-    case 'SWITCH_TO_PLANNING':
-    case 'SWITCH_TO_IMPLEMENTATION':
-      await updateMode(tool.params.mode);
-      break;
     case 'EXPLORATION_FINDINGS':
       await saveAiDocument('exploration-findings', tool.params);
       break;
@@ -997,26 +991,6 @@ async function handleDiscovery(params) {
   console.log('✓ Added discovery (importance: ' + importance + ')');
 }
 
-async function updateMode(newMode) {
-  const modeContent = await utils.readFileIfExists('mode.md');
-  const lines = modeContent.split('\n');
-  
-  const updated = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    if (trimmed === newMode) {
-      updated.push('x ' + newMode);
-    } else if (line.startsWith('x ')) {
-      updated.push('  ' + line.slice(2));
-    } else {
-      updated.push(line);
-    }
-  }
-  
-  await fs.writeFile('mode.md', updated.join('\n'), 'utf8');
-  console.log('✓ Switched to ' + newMode + ' mode');
-}
 
 async function executeTool(tool) {
   switch (tool.name) {
@@ -1715,7 +1689,10 @@ async function gitCommitAndPush(fileName, description) {
   }
 }
 
-module.exports = { processResponse: processResponse };
+module.exports = { 
+  processResponse: processResponse,
+  handleExtractionResponse: handleExtractionResponse
+};
 // ==========================================
 // prompt-budget-allocator.js
 // prompt-budget-allocator.js
@@ -2704,9 +2681,12 @@ function parseToolBlocks(text) {
     
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      // Remove the leading "│ " 
-      if (line.startsWith('│')) {
-        const content = line.substring(1).trimStart();
+      // Remove the leading "│ " (note: preserve indentation after the space)
+      if (line.startsWith('│ ')) {
+        const content = line.substring(2); // Skip "│ " but preserve indentation
+        cleanedLines.push(content);
+      } else if (line.startsWith('│')) {
+        const content = line.substring(1); // Handle case without space
         cleanedLines.push(content);
       }
     }
@@ -2748,7 +2728,7 @@ function parseToolBlocks(text) {
       
       // Extract content lines
       const contentLines = lines.slice(i + 1, endIndex);
-      const content = contentLines.join('\n').trim();
+      const content = contentLines.join('\n');
       
       // Parse based on tool type
       const params = parseToolParams(toolName, args, content);
@@ -2899,22 +2879,6 @@ function parseToolParams(toolName, args, content) {
       params.content = content;
       break;
       
-    case 'SWITCH_TO':
-      params.mode = args;
-      break;
-      
-    case 'SWITCH_TO_EXPLORATION':
-      params.mode = 'exploration';
-      break;
-      
-    case 'SWITCH_TO_PLANNING':
-      params.mode = 'planning';
-      break;
-      
-    case 'SWITCH_TO_IMPLEMENTATION':
-      params.mode = 'implementation';
-      break;
-      
     case 'EXPLORATION_FINDINGS':
       params.name = args;
       params.content = content;
@@ -2936,9 +2900,7 @@ function parseToolParams(toolName, args, content) {
 function classifyTools(tools) {
   const informationTools = ['READ_CODE', 'READ_REQUIREMENTS', 'SEARCH_NAME', 'SEARCH_CODE', 'SEARCH_REQUIREMENTS'];
   const responseTools = ['MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'DETAILED_PLAN', 
-                        'CREATE', 'UPDATE', 'INSERT', 'DELETE',
-                        'SWITCH_TO', 'SWITCH_TO_EXPLORATION', 'SWITCH_TO_PLANNING', 
-                        'SWITCH_TO_IMPLEMENTATION', 'COMMIT'];
+                        'CREATE', 'UPDATE', 'INSERT', 'DELETE', 'COMMIT'];
   
   const hasInfoTools = tools.some(t => informationTools.includes(t.name));
   const hasResponseTools = tools.some(t => responseTools.includes(t.name));
@@ -3278,12 +3240,6 @@ function compactConversation(conversationHistory, maxLength) {
       decisions.push('User requested: ' + userText.replace('> ', ''));
     }
     
-    if (assistantText.includes('[SWITCH_TO]')) {
-      const modeMatch = assistantText.match(/\[SWITCH_TO\]\s+(\w+)/);
-      if (modeMatch) {
-        decisions.push('Mode change to ' + modeMatch[1]);
-      }
-    }
     
     // Look for discoveries in assistant text
     if (assistantText.includes('[DISCOVERED]')) {
@@ -3426,9 +3382,8 @@ function fixBoxPadding(text) {
       const fixedLine = line.replace(/┘\s*$/, '');
       fixedLines.push(fixedLine);
     } else if (line.startsWith('│')) {
-      // Content line - just ensure it starts with "│ "
-      const content = line.substring(1).trimStart();
-      fixedLines.push('│ ' + content);
+      // Content line - preserve existing format
+      fixedLines.push(line);
     } else {
       fixedLines.push(line);
     }
