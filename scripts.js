@@ -1593,7 +1593,7 @@ function formatSystemToolResult(message) {
     headerText = headerText.substring(0, boxWidth - 5) + '... ';
   }
   const headerPadding = boxWidth - headerText.length - 2;
-  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═\n';
+  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '\n';
   
   // Process content lines
   const contentLines = lines.slice(1);
@@ -3591,7 +3591,7 @@ function findTemporaryBlock(conversation, startFrom = 0) {
       
       // Find the end of the block
       for (let j = i + 1; j < lines.length; j++) {
-        if (lines[j].match(/╚═+╝/)) {
+        if (lines[j].match(/╚═+$/)) {
           endLine = j;
           break;
         }
@@ -3640,7 +3640,7 @@ function formatTemporaryBlock(title, content, blockNumber = null, totalBlocks = 
     headerText = headerText.substring(0, boxWidth - 5) + '... ';
   }
   const headerPadding = boxWidth - headerText.length - 2;
-  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '═\n';
+  result += '╔═' + headerText + '═'.repeat(Math.max(0, headerPadding)) + '\n';
   
   // Add content lines WITHOUT padding or right border
   for (let i = 0; i < lines.length; i++) {
