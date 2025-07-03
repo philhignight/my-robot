@@ -249,7 +249,7 @@ async function buildPrompt(extractionMode = false) {
     const allocation = allocatePromptBudget(inputs, mode, new Date());
 
     // Build final prompt from allocations
-    let prompt = buildPromptFromAllocations(allocation.allocations, mode);
+    const prompt = buildPromptFromAllocations(allocation.allocations, mode);
 
     // Normalize multiple newlines to single newline
     prompt = prompt.replace(/\n{2,}/g, "\n");
@@ -766,7 +766,7 @@ async function handleResponseTypeError(errorMessage, responseText) {
     errorMessage +
     "\n\n" +
     "Response Rules:\n" +
-    "1. READ Response: Use ONLY [READ_CODE], [READ_REQUIREMENTS], [SEARCH_NAME], [SEARCH_CONTENT]\n" +
+    "1. READ Response: Use ONLY [READ_CODE], [READ_REQUIREMENTS], [SEARCH_NAME], [SEARCH_CODE], [SEARCH_REQUIREMENTS]\n" +
     "2. WRITE Response: Use [MESSAGE] for text and/or action tools\n" +
     "3. Wrap response in ┌─ ASSISTANT ─ box\n\n" +
     (responseText.includes("┌─ ASSISTANT")
@@ -861,7 +861,6 @@ async function handleReadResponse(responseText, tools) {
         });
       }
     } else if (
-      tool.name === "SEARCH_CONTENT" ||
       tool.name === "SEARCH_CODE" ||
       tool.name === "SEARCH_REQUIREMENTS"
     ) {
@@ -963,14 +962,12 @@ async function handleReadResponse(responseText, tools) {
       let title;
       if (block.type === "search") {
         title = "Search results";
-      } else if (block.type === "directory") {
-        title = "Folder contents";
       } else {
-        // Count how many files/directories in this block
-        const fileMatches = (block.content.match(/^[^\n]+:$/gm) || []).length;
-        const dirMatches = (block.content.match(/\(directory\):$/gm) || [])
-          .length;
-        if (dirMatches > 0 && fileMatches === dirMatches) {
+        // Check if block contains only directories by looking for "(directory):" marker
+        const dirCount = (block.content.match(/\(directory\):/g) || []).length;
+        const totalItems = (block.content.match(/^[^\n]+:$/gm) || []).length;
+
+        if (dirCount > 0 && dirCount === totalItems) {
           title = "Folder contents";
         } else {
           title = "File contents";
@@ -1205,8 +1202,6 @@ async function executeTool(tool) {
       return await executeRead(tool.params);
     case "SEARCH_NAME":
       return await executeSearchFilesByName(tool.params);
-    case "SEARCH_CONTENT":
-      return await executeSearchFilesByContent(tool.params);
     case "SEARCH_CODE":
       return await executeSearchCode(tool.params);
     case "SEARCH_REQUIREMENTS":
@@ -1588,13 +1583,20 @@ async function executeSearchFilesByName(params) {
   }
 }
 
-async function executeSearchFilesByContent(params) {
+async function executeSearchCode(params) {
   try {
     const searchPath = utils.getCodebasePath(params.folder);
-    const results = await utils.searchFilesByContent(searchPath, params.regex);
+    const results = await utils.searchFilesByContent(
+      searchPath,
+      params.regex,
+      "code"
+    );
     if (results.length === 0) {
       return (
-        'No content found matching "' + params.regex + '" in ' + params.folder
+        'No content found matching "' +
+        params.regex +
+        '" in code files in ' +
+        params.folder
       );
     }
 
@@ -1611,7 +1613,41 @@ async function executeSearchFilesByContent(params) {
 
     return output;
   } catch (err) {
-    return "Error searching content: " + err.message;
+    return "Error searching code: " + err.message;
+  }
+}
+
+async function executeSearchRequirements(params) {
+  try {
+    const searchPath = utils.getCodebasePath(params.folder);
+    const results = await utils.searchFilesByContent(
+      searchPath,
+      params.regex,
+      "requirements"
+    );
+    if (results.length === 0) {
+      return (
+        'No content found matching "' +
+        params.regex +
+        '" in requirements files in ' +
+        params.folder
+      );
+    }
+
+    let output = "";
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const relativePath = path.relative(utils.CODEBASE_PATH, result.file);
+      output +=
+        relativePath + " (lines " + result.lines + "):\n" + result.content;
+      if (i < results.length - 1) {
+        output += "\n\n";
+      }
+    }
+
+    return output;
+  } catch (err) {
+    return "Error searching requirements: " + err.message;
   }
 }
 
@@ -1694,74 +1730,6 @@ async function executeInsertLines(params) {
     };
   } catch (err) {
     return "Error inserting into " + params.file_name + ": " + err.message;
-  }
-}
-
-async function executeSearchCode(params) {
-  try {
-    const searchPath = utils.getCodebasePath(params.folder);
-    const results = await utils.searchFilesByContent(
-      searchPath,
-      params.regex,
-      "code"
-    );
-    if (results.length === 0) {
-      return (
-        'No content found matching "' +
-        params.regex +
-        '" in code files in ' +
-        params.folder
-      );
-    }
-
-    let output = "";
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i];
-      const relativePath = path.relative(utils.CODEBASE_PATH, result.file);
-      output +=
-        relativePath + " (lines " + result.lines + "):\n" + result.content;
-      if (i < results.length - 1) {
-        output += "\n\n";
-      }
-    }
-
-    return output;
-  } catch (err) {
-    return "Error searching code: " + err.message;
-  }
-}
-
-async function executeSearchRequirements(params) {
-  try {
-    const searchPath = utils.getCodebasePath(params.folder);
-    const results = await utils.searchFilesByContent(
-      searchPath,
-      params.regex,
-      "requirements"
-    );
-    if (results.length === 0) {
-      return (
-        'No content found matching "' +
-        params.regex +
-        '" in requirements files in ' +
-        params.folder
-      );
-    }
-
-    let output = "";
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i];
-      const relativePath = path.relative(utils.CODEBASE_PATH, result.file);
-      output +=
-        relativePath + " (lines " + result.lines + "):\n" + result.content;
-      if (i < results.length - 1) {
-        output += "\n\n";
-      }
-    }
-
-    return output;
-  } catch (err) {
-    return "Error searching requirements: " + err.message;
   }
 }
 
@@ -2177,11 +2145,16 @@ async function gitCommitAndPush(fileName, description) {
   const execAsync = promisify(exec);
 
   try {
-    await execAsync('git add "' + fileName + '"', { cwd: utils.CODEBASE_PATH });
+    // Use -- to prevent filename from being interpreted as option
+    await execAsync("git add -- " + JSON.stringify(fileName), {
+      cwd: utils.CODEBASE_PATH,
+    });
     console.log("✓ Git added: " + fileName);
 
-    const commitMessage = "AI: " + description;
-    await execAsync('git commit -m "' + commitMessage + '"', {
+    // Escape commit message properly
+    const commitMessage =
+      "AI: " + description.replace(/"/g, '\\"').replace(/\$/g, "\\$");
+    await execAsync("git commit -m " + JSON.stringify(commitMessage), {
       cwd: utils.CODEBASE_PATH,
     });
     console.log("✓ Git commit: " + commitMessage);
@@ -2818,7 +2791,6 @@ Tools allowed in the READ response type:
 - [READ_CODE]
 - [READ_REQUIREMENTS]
 - [SEARCH_NAME]
-- [SEARCH_CONTENT]
 - [SEARCH_CODE]
 - [SEARCH_REQUIREMENTS]
 
@@ -3224,7 +3196,6 @@ function generatePrompt(options) {
     TOOL_DOCS.READ_CODE,
     TOOL_DOCS.READ_REQUIREMENTS,
     TOOL_DOCS.SEARCH_NAME,
-    TOOL_DOCS.SEARCH_CONTENT,
     TOOL_DOCS.SEARCH_CODE,
     TOOL_DOCS.SEARCH_REQUIREMENTS,
   ].join("\n\n");
@@ -3691,7 +3662,6 @@ function classifyTools(tools) {
     "READ_CODE",
     "READ_REQUIREMENTS",
     "SEARCH_NAME",
-    "SEARCH_CONTENT",
     "SEARCH_CODE",
     "SEARCH_REQUIREMENTS",
   ];
