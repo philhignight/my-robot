@@ -149,9 +149,22 @@ async function buildPrompt(extractionMode = false) {
       // Remove any "=== AI RESPONSE READY ===" lines that might have been left
       conversationHistory = conversationHistory.split('\n')
         .filter(function(line) { 
-          return !line.includes('=== AI RESPONSE READY ===') && 
-                 !line.includes('Copy the contents of generated-prompt.md') &&
-                 !line.includes('[write here when ready]');
+          // Filter out response ready markers
+          if (line.includes('=== AI RESPONSE READY ===') || 
+              line.includes('Copy the contents of generated-prompt.md') ||
+              line.includes('[write here when ready]')) {
+            return false;
+          }
+          // Filter out ASCII art (Auto Generated banner)
+          if (line.includes('_____') && line.includes('__') ||
+              line.includes('/  _  \\') ||
+              line.includes('/  /_\\  \\') ||
+              line.includes('/    |    \\') ||
+              line.includes('\\____|__  /') ||
+              line.includes('\\/')) {
+            return false;
+          }
+          return true;
         })
         .join('\n');
     }
@@ -1799,33 +1812,8 @@ const CATEGORY_CONFIGS = {
         })
         .join('\n');
       
-      // Also filter out ALL temporary blocks - they should not be in normal prompts
-      const lines = cleanedContent.split('\n');
-      const filteredLines = [];
-      let inTempBlock = false;
-      
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        
-        // Check for temporary block start
-        if (line.includes('╔═ TEMPORARY:')) {
-          inTempBlock = true;
-          continue;
-        }
-        
-        // Check for temporary block end
-        if (inTempBlock && line.match(/╚═+$/)) {
-          inTempBlock = false;
-          continue;
-        }
-        
-        // Skip lines inside temporary blocks
-        if (!inTempBlock) {
-          filteredLines.push(line);
-        }
-      }
-      
-      const withoutTempBlocks = filteredLines.join('\n');
+      // Remove temporary blocks while preserving conversation structure
+      const withoutTempBlocks = cleanedContent;
       
       // Split conversation into individual exchanges
       const exchangeLines = withoutTempBlocks.split('\n');
@@ -1858,8 +1846,38 @@ const CATEGORY_CONFIGS = {
         exchanges.push(currentExchange.join('\n'));
       }
       
+      // Filter each exchange to remove temporary blocks and clean up
+      const cleanedExchanges = exchanges.map(exchange => {
+        const lines = exchange.split('\n');
+        const filteredLines = [];
+        let inTempBlock = false;
+        
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          
+          // Check for temporary block start
+          if (line.includes('╔═ TEMPORARY:')) {
+            inTempBlock = true;
+            continue;
+          }
+          
+          // Check for temporary block end
+          if (inTempBlock && line.match(/╚═+$/)) {
+            inTempBlock = false;
+            continue;
+          }
+          
+          // Skip lines inside temporary blocks
+          if (!inTempBlock) {
+            filteredLines.push(line);
+          }
+        }
+        
+        return filteredLines.join('\n');
+      }).filter(exchange => exchange.trim()); // Remove empty exchanges
+      
       // Return in reverse order (most recent first)
-      return exchanges.reverse();
+      return cleanedExchanges.reverse();
     },
     summarizer: (excluded) => {
       if (excluded.length === 0) return '';
