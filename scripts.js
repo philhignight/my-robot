@@ -1778,41 +1778,63 @@ const CATEGORY_CONFIGS = {
     weight: 40,
     required: false,
     selector: (content) => {
-      // Filter out waiting message lines first
+      // Filter out waiting message lines and ASCII art first
       const cleanedContent = content.split('\n')
-        .filter(line => !line.includes('=== WAITING FOR YOUR MESSAGE ===') && 
-                       line !== '[write here when ready]')
+        .filter(line => {
+          // Filter out waiting message markers
+          if (line.includes('=== WAITING FOR YOUR MESSAGE ===') || 
+              line === '[write here when ready]') {
+            return false;
+          }
+          // Filter out ASCII art (Auto Generated banner)
+          if (line.includes('_____') && line.includes('__') ||
+              line.includes('/  _  \\') ||
+              line.includes('/  /_\\  \\') ||
+              line.includes('/    |    \\') ||
+              line.includes('\\____|__  /') ||
+              line.includes('\\/')) {
+            return false;
+          }
+          return true;
+        })
         .join('\n');
       
       // Also filter out ALL temporary blocks - they should not be in normal prompts
-      const withoutTempBlocks = cleanedContent.split('\n').filter((line, index, arr) => {
-        // Check if we're in a temporary block
-        for (let i = index; i >= 0; i--) {
-          if (arr[i].includes('╔═ TEMPORARY:')) {
-            // We're inside a temp block, check if we've hit the end
-            for (let j = i; j <= index; j++) {
-              if (arr[j].includes('╚═') && j <= index) {
-                // We've passed the end, not in block anymore
-                break;
-              }
-              if (j === index) {
-                // Still in block
-                return false;
-              }
-            }
-          }
+      const lines = cleanedContent.split('\n');
+      const filteredLines = [];
+      let inTempBlock = false;
+      
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        
+        // Check for temporary block start
+        if (line.includes('╔═ TEMPORARY:')) {
+          inTempBlock = true;
+          continue;
         }
-        return true;
-      }).join('\n');
+        
+        // Check for temporary block end
+        if (inTempBlock && line.match(/╚═+$/)) {
+          inTempBlock = false;
+          continue;
+        }
+        
+        // Skip lines inside temporary blocks
+        if (!inTempBlock) {
+          filteredLines.push(line);
+        }
+      }
+      
+      const withoutTempBlocks = filteredLines.join('\n');
       
       // Split conversation into individual exchanges
-      const lines = cleanedContent.split('\n');
+      const exchangeLines = withoutTempBlocks.split('\n');
       const exchanges = [];
       let currentExchange = [];
       let inAssistantBox = false;
       
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
+      for (let i = 0; i < exchangeLines.length; i++) {
+        const line = exchangeLines[i];
         
         // Check if this starts a new user message
         if (line.startsWith('> ') && currentExchange.length > 0 && !inAssistantBox) {
