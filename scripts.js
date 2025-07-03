@@ -7,6 +7,18 @@ const utils = require('./utils');
 const { generatePrompt } = require('./prompt-generator');
 const { allocatePromptBudget, buildPromptFromAllocations } = require('./prompt-budget-allocator');
 
+async function ensureWaitingForMessage() {
+  const conversation = await utils.readFileIfExists('conversation.md');
+  const lines = conversation.split('\n');
+  const waitingIndex = lines.findIndex(line => line.includes('=== WAITING FOR YOUR MESSAGE ==='));
+  
+  if (waitingIndex === -1) {
+    // Need to add the waiting section
+    const updated = conversation.trim() + '\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]';
+    await fs.writeFile('conversation.md', updated, 'utf8');
+  }
+}
+
 async function executeTwoLevelList(params) {
   try {
     const dirPath = utils.getCodebasePath(params.path || '.');
@@ -110,12 +122,8 @@ async function buildPrompt(extractionMode = false) {
       return buildExtractionPrompt(tempBlock);
     }
     
-    const mode = utils.getActiveMode(await utils.readFileIfExists('mode.md'));
     const goals = await utils.readFileIfExists('goals.md');
     const context = await utils.readFileIfExists('ai-managed/context.md');
-    const discoveries = await utils.readFileIfExists('ai-managed/discoveries.md');
-    const explorationFindings = await utils.readFileIfExists('ai-managed/exploration-findings.md');
-    const detailedPlan = await utils.readFileIfExists('ai-managed/detailed-plan.md');
     
     // Generate 2-level directory listing
     const readTool = {
@@ -150,7 +158,6 @@ async function buildPrompt(extractionMode = false) {
     
     // Generate base prompt
     const basePrompt = generatePrompt({
-      mode: mode,
       goals: '',  // We'll handle these through the allocator
       projectStructure: '',  // We'll handle these through the allocator
       additionalContext: '',  // We'll handle these through the allocator
@@ -161,27 +168,27 @@ async function buildPrompt(extractionMode = false) {
     const inputs = {
       basePrompt: basePrompt,
       conversation: conversationHistory,
-      discoveries: discoveries,
       projectStructure: projectStructure,
       goals: goals,
-      additionalContext: context,
-      explorationFindings: explorationFindings,
-      detailedPlan: detailedPlan
+      additionalContext: context
     };
     
     // Allocate budget optimally
-    const allocation = allocatePromptBudget(inputs, mode, new Date());
+    const allocation = allocatePromptBudget(inputs, new Date());
     
     // Build final prompt from allocations
-    let prompt = buildPromptFromAllocations(allocation.allocations, mode);
+    let prompt = buildPromptFromAllocations(allocation.allocations);
     
     // Normalize multiple newlines to single newline
     prompt = prompt.replace(/\n{2,}/g, '\n');
     
     await fs.writeFile('generated-prompt.md', prompt, 'utf8');
     
-    console.log('✓ Built prompt for ' + mode + ' mode');
+    console.log('✓ Built prompt');
     console.log('📊 Budget usage: ' + allocation.totalUsed.toLocaleString() + ' / ' + allocation.budget.toLocaleString() + ' characters (' + Math.round(allocation.totalUsed / allocation.budget * 100) + '%)');
+    
+    // Ensure conversation.md has proper format for next user input
+    await ensureWaitingForMessage();
     
     // Log what was included/excluded
     for (const [category, alloc] of Object.entries(allocation.allocations)) {
@@ -286,8 +293,6 @@ You are reviewing data from ${isDirectory ? 'a directory listing' : isFileConten
 6) This is block ${blockNumber} of ${totalBlocks} - there ${totalBlocks > 1 ? 'are more blocks to process' : 'is only this block'}
 
 ## Current Context
-
-MODE: ${mode}
 
 `;
 
@@ -399,7 +404,7 @@ From the directory listing, extract ONLY information relevant to your current ta
 - Notable subdirectories relevant to what you're working on
 - Any unexpected or concerning file structures that impact your work
 
-DO NOT extract every file - focus on what's needed for your current ${mode} mode objectives.
+DO NOT extract every file - focus on what's needed for your current objectives.
 
 Format: List only the file paths you need to examine, one per line.
 
@@ -415,7 +420,7 @@ This block contains multiple files. For each file, extract ONLY information rele
 - Issues or patterns that impact your task
 - Relevant configuration or setup
 
-DO NOT summarize everything - focus on what matters for your current ${mode} mode objectives.
+DO NOT summarize everything - focus on what matters for your current objectives.
 Remember: You're analyzing files to understand specific aspects, not cataloging all content.
 
 `;
@@ -432,7 +437,7 @@ From ${fileName}, extract ONLY information relevant to your current task:
 - Security/performance issues impacting your goals
 - Relevant algorithms or business logic
 
-Focus on your current ${mode} mode objectives. DO NOT catalog everything.
+Focus on your current objectives. DO NOT catalog everything.
 Include line numbers only for findings directly relevant to your task.
 
 `;
@@ -445,7 +450,7 @@ From ${fileName}, extract ONLY information relevant to your current task:
 - Business rules relevant to your objectives
 - Open questions about your task area
 
-Focus on your current ${mode} mode objectives. DO NOT summarize the entire document.
+Focus on your current objectives. DO NOT summarize the entire document.
 
 `;
       }
@@ -459,7 +464,7 @@ From these search results, extract ONLY findings relevant to your current task:
 - Architecture insights affecting your approach
 - Issues or opportunities for your specific work
 
-Focus on your current ${mode} mode objectives. DO NOT list every match.
+Focus on your current objectives. DO NOT list every match.
 
 `;
       } else if (searchType === 'requirements') {
@@ -471,7 +476,7 @@ From these search results, extract ONLY findings relevant to your current task:
 - Business rules relevant to your objectives
 - Key documents to review further
 
-Focus on your current ${mode} mode objectives. DO NOT catalog all matches.
+Focus on your current objectives. DO NOT catalog all matches.
 
 `;
       } else {
@@ -482,7 +487,7 @@ From these search results, extract ONLY findings relevant to your current task:
 - Patterns affecting your approach
 - Locations needing further investigation
 
-Focus on your current ${mode} mode objectives, not comprehensive coverage.
+Focus on your current objectives, not comprehensive coverage.
 
 `;
       }
@@ -1559,8 +1564,25 @@ async function updateConversation(newMessage) {
     // Append new message to history
     const newHistory = historyContent + (historyContent ? '\n\n' : '') + wrappedMessage;
     
-    // Rebuild file with input area at bottom
-    const updated = '=== CONVERSATION HISTORY ===\n\n' + newHistory + '\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]';
+    // Check if we're ready for user input or if this is auto-generated
+    // Auto-generated prompts happen when we have temporary blocks to process
+    const hasTemporaryBlock = wrappedMessage.includes('╔═ TEMPORARY:');
+    
+    // Rebuild file with appropriate bottom section
+    let updated;
+    if (hasTemporaryBlock) {
+      // Show ASCII art for auto-generated prompt
+      const asciiArt = `   _____          __                       ________                                   __             .___
+  /  _  \\  __ ___/  |_  ____              /  _____/  ____   ____   ________________ _/  |_  ____   __| _/
+ /  /_\\  \\|  |  \\   __\\/  _ \\    ______  /   \\  ____/ __ \\ /    \\_/ __ \\_  __ \\__  \\\\   __\\/ __ \\ / __ | 
+/    |    \\  |  /|  | (  <_> )  /_____/  \\    \\_\\  \\  ___/|   |  \\  ___/|  | \\// __ \\|  | \\  ___// /_/ | 
+\\____|__  /____/ |__|  \\____/             \\______  /\\___  >___|  /\\___  >__|  (____  /__|  \\___  >____ | 
+        \\/                                       \\/     \\/     \\/     \\/           \\/          \\/     \\/ `;
+      updated = '=== CONVERSATION HISTORY ===\n\n' + newHistory + '\n\n' + asciiArt;
+    } else {
+      // Ready for user input
+      updated = '=== CONVERSATION HISTORY ===\n\n' + newHistory + '\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]';
+    }
     
     await fs.writeFile('conversation.md', updated, 'utf8');
   }
@@ -1945,32 +1967,7 @@ const CATEGORY_CONFIGS = {
     }
   },
   
-  detailedPlan: {
-    weight: 20,
-    required: false,
-    modes: ['planning', 'implementation'],
-    selector: (content) => content,
-    summarizer: (content) => {
-      const lines = content.split('\n');
-      const tasks = lines.filter(l => l.match(/^\d+\./));
-      return `=== PLAN SUMMARY ===\nImplementation plan with ${tasks.length} tasks\n` +
-             tasks.slice(0, 5).join('\n') + 
-             (tasks.length > 5 ? `\n... and ${tasks.length - 5} more tasks` : '');
-    }
-  },
-  
-  explorationFindings: {
-    weight: 20,
-    required: false,
-    selector: (content) => content,
-    summarizer: (content) => {
-      const lines = content.split('\n');
-      const headers = lines.filter(l => l.startsWith('#'));
-      return `=== EXPLORATION SUMMARY ===\n` +
-             `Key sections: ${headers.slice(0, 3).join(', ')}\n` +
-             `Total findings: ${lines.length} lines\n`;
-    }
-  },
+  // Removed detailedPlan and explorationFindings - no longer needed without modes
   
   goals: {
     weight: 5,
@@ -1991,16 +1988,13 @@ const CATEGORY_CONFIGS = {
 };
 
 // Main allocation function
-function allocatePromptBudget(inputs, mode, currentDate) {
+function allocatePromptBudget(inputs, currentDate) {
   const budget = BUDGET_LIMIT;
   const targetUsage = budget * BUDGET_TARGET;
   
-  // Filter categories by mode and availability
+  // Filter categories by availability
   const activeCategories = [];
   for (const [name, config] of Object.entries(CATEGORY_CONFIGS)) {
-    // Skip if mode-specific and not in current mode
-    if (config.modes && !config.modes.includes(mode)) continue;
-    
     // Skip if no content provided
     if (!inputs[name] || inputs[name].trim() === '') continue;
     
@@ -2225,7 +2219,7 @@ const utils = require('./utils');
 // Base prompt that's always included
 const BASE_PROMPT = `# AI Development Assistant Base Prompt
 
-You are an AI development assistant helping with requirements analysis and code analysis, planning, and implementation. You work in three distinct modes and have access to powerful tools for file operations.
+You are an AI development assistant helping with requirements analysis, code analysis, planning, and implementation. You have access to powerful tools for file operations.
 
 ## Instructions
  
@@ -2270,66 +2264,15 @@ Tools allowed in the READ response type:
 - [SEARCH_CODE]
 - [SEARCH_REQUIREMENTS]
 
-Tools allowed in the WRITE response type: `;
+Tools allowed in the WRITE response type:
+- [MESSAGE]
+- [CREATE]
+- [UPDATE]
+- [INSERT]
+- [DELETE]
+- [COMMIT]
 
-// Mode-specific configurations
-const MODE_CONFIGS = {
-  exploration: {
-    writeTools: ['MESSAGE', 'DISCOVERED', 'EXPLORATION_FINDINGS', 'SWITCH_TO_PLANNING'],
-    modeInstructions: `# EXPLORATION MODE
-
-Your job is to understand the codebase and requirements:
-
-- Use READ_CODE to explore source files and examine implementation
-- Use READ_REQUIREMENTS to review documentation and specifications  
-- Use SEARCH_NAME to find files by name patterns
-- Use SEARCH_CODE for code-specific searches, SEARCH_REQUIREMENTS for docs
-- Use MESSAGE to ask clarifying questions or provide updates
-- Document findings with DISCOVERED blocks (importance 1-10)
-- When you have sufficient understanding, create exploration findings
-- Use SWITCH_TO_PLANNING when ready to create an implementation plan
-
-Remember: NO plain text allowed outside of tools. Use [MESSAGE] for all communication.
-
-Focus on understanding, not solving yet. Be thorough in your exploration.`
-  },
-  planning: {
-    writeTools: ['MESSAGE', 'DISCOVERED', 'DETAILED_PLAN', 'SWITCH_TO_EXPLORATION', 'SWITCH_TO_IMPLEMENTATION'],
-    modeInstructions: `# PLANNING MODE
-
-Your job is to create a detailed implementation plan:
-
-- Review the exploration findings to understand the current state
-- Use [MESSAGE] to ask final clarifying questions
-- Break down work into specific, concrete tasks with file changes
-- Create detailed-plan using [DETAILED_PLAN] tool
-- Each task should specify exactly which files to modify and how
-- Use [MESSAGE] to explain your plan
-- Use SWITCH_TO_IMPLEMENTATION when plan is complete and ready to execute
-- Use SWITCH_TO_EXPLORATION if you need more information about the codebase
-
-Remember: NO plain text allowed. Use [MESSAGE] for all explanations.
-
-Be thorough - implementation should have no surprises.`
-  },
-  implementation: {
-    writeTools: ['MESSAGE', 'DISCOVERED', 'CREATE', 'UPDATE', 'INSERT', 'DELETE', 'COMMIT', 'SWITCH_TO_EXPLORATION', 'SWITCH_TO_PLANNING'],
-    modeInstructions: `# IMPLEMENTATION MODE
-
-Your job is to execute the implementation plan:
-
-- Follow the detailed plan exactly as specified
-- Use UPDATE, INSERT, CREATE tools to make changes
-- Include descriptive change_description for all file operations
-- Use [MESSAGE] to explain what you're doing
-- Work through plan items systematically
-- Use SWITCH_TO_EXPLORATION if you hit unexpected issues and need more analysis
-- Use SWITCH_TO_PLANNING if the plan needs significant revision
-- Focus on execution, not replanning
-
-Remember: NO plain text allowed. Use [MESSAGE] for all communication.`
-  }
-};
+`;
 
 // Tool documentation
 const TOOL_DOCS = {
@@ -2413,7 +2356,7 @@ Finding all user stories
 Finding acceptance criteria
 \`\`\``,
 
-  // WRITE tools (mode-specific)
+  // WRITE tools
   MESSAGE: `**[MESSAGE]**
 Communicate with the user. Content continues until next tool or box end.
 If your message contains tool keywords in brackets like [READ] or [SEARCH_NAME], end with [END_MESSAGE].
@@ -2421,33 +2364,6 @@ If your message contains tool keywords in brackets like [READ] or [SEARCH_NAME],
 [MESSAGE]
 I found several issues in your code.
 Let me explain what needs fixing.
-\`\`\``,
-
-  DISCOVERED: `**[DISCOVERED] importance**
-Document finding (importance 1-10)
-\`\`\`
-[DISCOVERED] 9
-Critical security issue: passwords stored in plain text
-\`\`\``,
-
-  EXPLORATION_FINDINGS: `**[EXPLORATION_FINDINGS] name**
-Save exploration findings
-\`\`\`
-[EXPLORATION_FINDINGS] auth-analysis
-# Authentication System Analysis
-- Uses Express sessions
-- No password hashing
-- Missing rate limiting
-\`\`\``,
-
-  DETAILED_PLAN: `**[DETAILED_PLAN] name**
-Save implementation plan
-\`\`\`
-[DETAILED_PLAN] security-fixes
-# Security Implementation Plan
-1. Add bcrypt for passwords
-2. Implement rate limiting
-3. Add input validation
 \`\`\``,
 
   CREATE: `**[CREATE] filepath**
@@ -2486,27 +2402,6 @@ Delete file
 Removing deprecated auth system
 \`\`\``,
 
-  SWITCH_TO_EXPLORATION: `**[SWITCH_TO_EXPLORATION]**
-Switch back to exploration mode to gather more information
-\`\`\`
-[SWITCH_TO_EXPLORATION]
-Need to understand the database schema before continuing
-\`\`\``,
-
-  SWITCH_TO_PLANNING: `**[SWITCH_TO_PLANNING]**
-Switch to planning mode to create/revise implementation plan
-\`\`\`
-[SWITCH_TO_PLANNING]
-Ready to create a detailed implementation plan
-\`\`\``,
-
-  SWITCH_TO_IMPLEMENTATION: `**[SWITCH_TO_IMPLEMENTATION]**
-Switch to implementation mode to execute the plan
-\`\`\`
-[SWITCH_TO_IMPLEMENTATION]
-Plan is complete, ready to start implementing
-\`\`\``,
-
   COMMIT: `**[COMMIT]**
 Confirm file changes
 \`\`\`
@@ -2539,8 +2434,9 @@ Example NOT needing END tag:
 [MESSAGE]
 I'll analyze your authentication system now.
 
-[DISCOVERED] 8
-Found Express.js authentication setup with session management
+[CREATE] src/auth.js
+# New authentication module
+const bcrypt = require('bcrypt');
 \`\`\`
 
 ## VALID RESPONSE EXAMPLES
@@ -2569,9 +2465,12 @@ Found Express.js authentication setup with session management
 │ 2. No input validation                                              │
 │ 3. Missing rate limiting                                            │
 │                                                                     │
-│ [DISCOVERED] 9                                                      │
-│ Critical: Plain text passwords in auth.js line 45. User.create()    │
-│ saves req.body.password directly.                                   │
+│ Let me fix these issues now.                                        │
+│                                                                     │
+│ [UPDATE] src/auth.js 45 50                                          │
+│ # Add password hashing                                              │
+│   const hashedPassword = await bcrypt.hash(password, 10);           │
+│   user.password = hashedPassword;                                   │
 └─────────────────────────────────────────────────────────────────────┘
 \`\`\`
 
@@ -2585,7 +2484,6 @@ Found Express.js authentication setup with session management
 - **Smart termination**: Tools end at next tool line or box closure
 - **Progressive discovery**: Start with [READ_CODE] . at root, explore as needed
 - **One file operation at a time**: For [UPDATE] and [INSERT] operations
-- **Document importance**: Rate [DISCOVERED] items 1-10
 - **# Description pattern**: Use # for descriptions in [CREATE], [UPDATE], [INSERT]
 
 ## WORKFLOW PATTERN
@@ -2594,33 +2492,18 @@ Found Express.js authentication setup with session management
 2. **READ Response** (gather information) → 
 3. **Tool Results** → 
 4. **WRITE Response** (analyze/act) → 
-5. **Repeat as needed**
-
-## DISCOVERY IMPORTANCE SCALE
-
-- **1-3**: Minor details, code style issues
-- **4-6**: Important patterns, architecture decisions
-- **7-9**: Critical bugs, security issues
-- **10**: Catastrophic issues (never removed from memory)`;
+5. **Repeat as needed**`;
 
 function generatePrompt(options) {
   const {
-    mode = 'exploration',
     goals = '',
     projectStructure = '',
     additionalContext = '',
     conversationHistory = ''
   } = options;
 
-  // Validate mode
-  if (!MODE_CONFIGS[mode]) {
-    throw new Error('Invalid mode: ' + mode + '. Must be exploration, planning, or implementation');
-  }
-
-  const config = MODE_CONFIGS[mode];
-  
-  // Build the write tools list for this mode
-  let writeToolsList = '- ' + config.writeTools.join('\n- ');
+  // Build the write tools list
+  let writeToolsList = '- MESSAGE\n- CREATE\n- UPDATE\n- INSERT\n- DELETE\n- COMMIT';
   
   // Tool documentation rebuild to include READ-specific docs
   let toolDocs = '\n\n#2 Generate your response inside the ASCII box using ONLY tools from your chosen type.\n\n## TOOL FORMATS (POSITIONAL PARAMETERS)\n\n### READ Tools (Information Gathering)\n\n';
@@ -2628,21 +2511,13 @@ function generatePrompt(options) {
   // Add READ tool docs (always available)
   toolDocs += [TOOL_DOCS.READ_CODE, TOOL_DOCS.READ_REQUIREMENTS, TOOL_DOCS.SEARCH_NAME, TOOL_DOCS.SEARCH_CODE, TOOL_DOCS.SEARCH_REQUIREMENTS].join('\n\n');
   
-  // Add WRITE tool docs (mode-specific)
+  // Add WRITE tool docs
   toolDocs += '\n\n### WRITE Tools (Response and Actions)\n\n';
-  const writeToolDocs = [];
-  for (const tool of config.writeTools) {
-    if (TOOL_DOCS[tool]) {
-      writeToolDocs.push(TOOL_DOCS[tool]);
-    }
-  }
+  const writeToolDocs = [TOOL_DOCS.MESSAGE, TOOL_DOCS.CREATE, TOOL_DOCS.UPDATE, TOOL_DOCS.INSERT, TOOL_DOCS.DELETE, TOOL_DOCS.COMMIT];
   toolDocs += writeToolDocs.join('\n\n');
 
   // Build the complete prompt
   let prompt = BASE_PROMPT + writeToolsList + toolDocs + PROMPT_FOOTER;
-  
-  // Add mode instructions
-  prompt += '\n\n' + config.modeInstructions;
   
   // Add goals if provided
   if (goals && goals.trim() && goals.trim() !== '# Project Goals\n\nAdd your high-level objectives here') {
@@ -2697,9 +2572,6 @@ async function reset() {
       "generated-prompt.md",
       "pending-changes.json",
       "ai-managed/context.md",
-      "ai-managed/discoveries.md",
-      "ai-managed/exploration-findings.md",
-      "ai-managed/detailed-plan.md",
     ];
 
     for (let i = 0; i < filesToClear.length; i++) {
@@ -2722,13 +2594,7 @@ async function reset() {
       }
     }
 
-    // Reset mode to exploration
-    await fs.writeFile(
-      "mode.md",
-      "x exploration\n  planning\n  implementation",
-      "utf8"
-    );
-    console.log("✓ Reset mode to exploration");
+    // Mode system removed - no longer needed
 
     // Keep goals.md and prompt files intact
     console.log("✓ Preserved goals.md and prompt templates");
@@ -2807,11 +2673,7 @@ function getActiveSelection(content) {
     .map(function(line) { return line.slice(2).trim(); });
 }
 
-function getActiveMode(content) {
-  const lines = content.split('\n');
-  const activeLine = lines.find(function(line) { return line.startsWith('x '); });
-  return activeLine ? activeLine.slice(2).trim() : 'exploration';
-}
+// Mode functions removed - no longer needed
 
 function parseBlocks(text) {
   const blocks = {};
@@ -3662,12 +3524,372 @@ function removeTemporaryBlock(conversation, startLine, endLine) {
   return before.concat(after).join('\n');
 }
 
+// ASCII Art Generator for large text
+function generateASCIIArt(text) {
+  // Define ASCII art patterns for each character (5 lines tall)
+  const asciiPatterns = {
+    'A': [
+      '  █████  ',
+      ' ██   ██ ',
+      ' ███████ ',
+      ' ██   ██ ',
+      ' ██   ██ '
+    ],
+    'B': [
+      ' ██████  ',
+      ' ██   ██ ',
+      ' ██████  ',
+      ' ██   ██ ',
+      ' ██████  '
+    ],
+    'C': [
+      '  ██████ ',
+      ' ██      ',
+      ' ██      ',
+      ' ██      ',
+      '  ██████ '
+    ],
+    'D': [
+      ' ██████  ',
+      ' ██   ██ ',
+      ' ██   ██ ',
+      ' ██   ██ ',
+      ' ██████  '
+    ],
+    'E': [
+      ' ███████ ',
+      ' ██      ',
+      ' █████   ',
+      ' ██      ',
+      ' ███████ '
+    ],
+    'F': [
+      ' ███████ ',
+      ' ██      ',
+      ' █████   ',
+      ' ██      ',
+      ' ██      '
+    ],
+    'G': [
+      '  ██████ ',
+      ' ██      ',
+      ' ██   ███',
+      ' ██    ██',
+      '  ██████ '
+    ],
+    'H': [
+      ' ██   ██ ',
+      ' ██   ██ ',
+      ' ███████ ',
+      ' ██   ██ ',
+      ' ██   ██ '
+    ],
+    'I': [
+      ' ██ ',
+      ' ██ ',
+      ' ██ ',
+      ' ██ ',
+      ' ██ '
+    ],
+    'J': [
+      '      ██ ',
+      '      ██ ',
+      '      ██ ',
+      ' ██   ██ ',
+      '  █████  '
+    ],
+    'K': [
+      ' ██   ██ ',
+      ' ██  ██  ',
+      ' █████   ',
+      ' ██  ██  ',
+      ' ██   ██ '
+    ],
+    'L': [
+      ' ██      ',
+      ' ██      ',
+      ' ██      ',
+      ' ██      ',
+      ' ███████ '
+    ],
+    'M': [
+      ' ███   ███ ',
+      ' ████ ████ ',
+      ' ██ ███ ██ ',
+      ' ██     ██ ',
+      ' ██     ██ '
+    ],
+    'N': [
+      ' ███   ██ ',
+      ' ████  ██ ',
+      ' ██ ██ ██ ',
+      ' ██  ████ ',
+      ' ██   ███ '
+    ],
+    'O': [
+      '  ██████  ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      '  ██████  '
+    ],
+    'P': [
+      ' ██████  ',
+      ' ██   ██ ',
+      ' ██████  ',
+      ' ██      ',
+      ' ██      '
+    ],
+    'Q': [
+      '  ██████  ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      ' ██ ▄▄ ██ ',
+      '  ██████  '
+    ],
+    'R': [
+      ' ██████  ',
+      ' ██   ██ ',
+      ' ██████  ',
+      ' ██   ██ ',
+      ' ██   ██ '
+    ],
+    'S': [
+      ' ███████ ',
+      ' ██      ',
+      ' ███████ ',
+      '      ██ ',
+      ' ███████ '
+    ],
+    'T': [
+      ' ████████ ',
+      '    ██    ',
+      '    ██    ',
+      '    ██    ',
+      '    ██    '
+    ],
+    'U': [
+      ' ██    ██ ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      '  ██████  '
+    ],
+    'V': [
+      ' ██    ██ ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      '  ██  ██  ',
+      '   ████   '
+    ],
+    'W': [
+      ' ██     ██ ',
+      ' ██     ██ ',
+      ' ██  █  ██ ',
+      ' ██ ███ ██ ',
+      '  ███ ███  '
+    ],
+    'X': [
+      ' ██   ██ ',
+      '  ██ ██  ',
+      '   ███   ',
+      '  ██ ██  ',
+      ' ██   ██ '
+    ],
+    'Y': [
+      ' ██    ██ ',
+      '  ██  ██  ',
+      '   ████   ',
+      '    ██    ',
+      '    ██    '
+    ],
+    'Z': [
+      ' ███████ ',
+      '     ██  ',
+      '    ██   ',
+      '   ██    ',
+      ' ███████ '
+    ],
+    ' ': [
+      '     ',
+      '     ',
+      '     ',
+      '     ',
+      '     '
+    ],
+    '0': [
+      '  ██████  ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      ' ██    ██ ',
+      '  ██████  '
+    ],
+    '1': [
+      '   ██ ',
+      ' ████ ',
+      '   ██ ',
+      '   ██ ',
+      ' ████ '
+    ],
+    '2': [
+      ' ██████  ',
+      '      ██ ',
+      '  █████  ',
+      ' ██      ',
+      ' ███████ '
+    ],
+    '3': [
+      ' ██████  ',
+      '      ██ ',
+      '  █████  ',
+      '      ██ ',
+      ' ██████  '
+    ],
+    '4': [
+      ' ██   ██ ',
+      ' ██   ██ ',
+      ' ███████ ',
+      '      ██ ',
+      '      ██ '
+    ],
+    '5': [
+      ' ███████ ',
+      ' ██      ',
+      ' ███████ ',
+      '      ██ ',
+      ' ███████ '
+    ],
+    '6': [
+      '  ██████ ',
+      ' ██      ',
+      ' ███████ ',
+      ' ██    ██',
+      '  ██████ '
+    ],
+    '7': [
+      ' ███████ ',
+      '      ██ ',
+      '     ██  ',
+      '    ██   ',
+      '   ██    '
+    ],
+    '8': [
+      '  ██████ ',
+      ' ██    ██',
+      '  ██████ ',
+      ' ██    ██',
+      '  ██████ '
+    ],
+    '9': [
+      '  ██████ ',
+      ' ██    ██',
+      '  ███████',
+      '       ██',
+      '  ██████ '
+    ]
+  };
+
+  // Convert text to uppercase and split into lines if needed
+  const lines = text.toUpperCase().split('\n');
+  const result = [];
+
+  for (const line of lines) {
+    // Initialize 5 empty strings for each line of ASCII art
+    const asciiLines = ['', '', '', '', ''];
+    
+    // Process each character in the line
+    for (const char of line) {
+      const pattern = asciiPatterns[char] || asciiPatterns[' '];
+      
+      // Add each line of the character pattern to the corresponding ASCII line
+      for (let i = 0; i < 5; i++) {
+        asciiLines[i] += pattern[i] + ' '; // Add space between characters
+      }
+    }
+    
+    // Add the completed ASCII lines to the result
+    result.push(...asciiLines);
+    result.push(''); // Add empty line between text lines
+  }
+
+  return result.join('\n');
+}
+
+// Simpler alternative using block characters for smaller text
+function generateSimpleASCII(text, style = 'block') {
+  if (style === 'block') {
+    // Simple block style using Unicode block characters
+    const blockMap = {
+      'A': '█▀█\n█▀█\n▀ ▀',
+      'B': '█▀▄\n█▀▄\n▀▀ ',
+      'C': '█▀▀\n█  \n▀▀▀',
+      'D': '█▀▄\n█ █\n▀▀ ',
+      'E': '█▀▀\n█▀ \n▀▀▀',
+      'F': '█▀▀\n█▀ \n▀  ',
+      'G': '█▀▀\n█ █\n▀▀▀',
+      'H': '█ █\n█▀█\n▀ ▀',
+      'I': '█\n█\n▀',
+      'J': '  █\n  █\n▀▀ ',
+      'K': '█ █\n█▀▄\n▀ ▀',
+      'L': '█  \n█  \n▀▀▀',
+      'M': '█▄ ▄█\n█ ▀ █\n▀   ▀',
+      'N': '█▄ █\n█ ▀█\n▀  ▀',
+      'O': '█▀█\n█ █\n▀▀▀',
+      'P': '█▀█\n█▀▀\n▀  ',
+      'Q': '█▀█\n█ █\n▀▀█',
+      'R': '█▀█\n█▀▄\n▀ ▀',
+      'S': '█▀▀\n▀▀█\n▀▀▀',
+      'T': '▀█▀\n █ \n ▀ ',
+      'U': '█ █\n█ █\n▀▀▀',
+      'V': '█ █\n█ █\n ▀ ',
+      'W': '█   █\n█ █ █\n ▀ ▀ ',
+      'X': '█ █\n ▀ \n█ █',
+      'Y': '█ █\n ▀ \n █ ',
+      'Z': '▀▀█\n ▄▀\n▀▀▀',
+      ' ': '   \n   \n   ',
+      '0': '█▀█\n█ █\n▀▀▀',
+      '1': ' █ \n██ \n ▀ ',
+      '2': '█▀█\n ▄▀\n▀▀▀',
+      '3': '█▀█\n ▀█\n▀▀▀',
+      '4': '█ █\n▀▀█\n  ▀',
+      '5': '█▀▀\n▀▀█\n▀▀▀',
+      '6': '█▀▀\n█▀█\n▀▀▀',
+      '7': '▀▀█\n  █\n  ▀',
+      '8': '█▀█\n█▀█\n▀▀▀',
+      '9': '█▀█\n▀▀█\n▀▀▀'
+    };
+
+    const lines = text.toUpperCase().split('\n');
+    const result = [];
+
+    for (const line of lines) {
+      const charLines = ['', '', ''];
+      
+      for (const char of line) {
+        const pattern = blockMap[char] || blockMap[' '];
+        const patternLines = pattern.split('\n');
+        
+        for (let i = 0; i < 3; i++) {
+          charLines[i] += patternLines[i] + ' ';
+        }
+      }
+      
+      result.push(...charLines);
+      result.push(''); // Empty line between text lines
+    }
+
+    return result.join('\n');
+  }
+  
+  // Default to regular text if style not recognized
+  return text;
+}
+
 module.exports = {
   CODEBASE_PATH: CODEBASE_PATH,
   ensureDir: ensureDir,
   readFileIfExists: readFileIfExists,
   getActiveSelection: getActiveSelection,
-  getActiveMode: getActiveMode,
   parseToolBlocks: parseToolBlocks,
   classifyTools: classifyTools,
   validateResponseType: validateResponseType,
@@ -3689,7 +3911,9 @@ module.exports = {
   fixBoxPadding: fixBoxPadding,
   findTemporaryBlock: findTemporaryBlock,
   formatTemporaryBlock: formatTemporaryBlock,
-  removeTemporaryBlock: removeTemporaryBlock
+  removeTemporaryBlock: removeTemporaryBlock,
+  generateASCIIArt: generateASCIIArt,
+  generateSimpleASCII: generateSimpleASCII
 };
 // ==========================================
 // watcher.js
@@ -3713,18 +3937,29 @@ async function handleConversationChange() {
     const messageIndex = lines.findIndex(function (line) {
       return line.includes("=== WAITING FOR YOUR MESSAGE ===");
     });
+    
+    console.log("Debug: messageIndex =", messageIndex);
+    console.log("Debug: total lines =", lines.length);
 
     if (messageIndex !== -1 && messageIndex + 1 < lines.length) {
       const messageContent = lines[messageIndex + 1];
+      console.log("Debug: messageContent =", JSON.stringify(messageContent));
+      console.log("Debug: trimmed =", JSON.stringify(messageContent.trim()));
+      
       if (
         messageContent.trim() &&
         messageContent !== "[write here when ready]"
       ) {
+        console.log("Debug: Processing new message");
         await moveMessageToHistory(messageContent);
         await buildPrompt();
         console.log("✓ New prompt ready in generated-prompt.md");
         return;
+      } else {
+        console.log("Debug: Message not processed - empty or placeholder");
       }
+    } else {
+      console.log("Debug: No valid message position found");
     }
   } catch (err) {
     console.error("Error handling conversation change:", err);
@@ -3769,7 +4004,6 @@ async function createInitialFiles() {
   const initialFiles = {
     "conversation.md":
       "=== CONVERSATION HISTORY ===\n\n=== WAITING FOR YOUR MESSAGE ===\n[write here when ready]",
-    "mode.md": "x exploration\n  planning\n  implementation",
     "goals.md": "# Project Goals\n\nAdd your high-level objectives here",
     "ai-response.md": "",
     "generated-prompt.md": "",
