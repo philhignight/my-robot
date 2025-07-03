@@ -3,6 +3,7 @@
 
 const fs = require("fs").promises;
 const path = require("path");
+const path = require("path");
 const utils = require("./utils");
 const { generatePrompt } = require("./prompt-generator");
 const {
@@ -322,10 +323,7 @@ async function buildExtractionPrompt(tempBlock) {
 
     // Determine the type of content from the title
     const isDirectory = tempBlock.title.includes("Contents of ");
-    const isSearchResult =
-      tempBlock.title.includes("Content matches") ||
-      tempBlock.title.includes("Files found") ||
-      tempBlock.title.includes("Search results");
+    const isSearchResult = tempBlock.title === "Search results";
     const isFileContent = tempBlock.title === "File contents";
     const isSingleFile =
       !isFileContent &&
@@ -333,6 +331,38 @@ async function buildExtractionPrompt(tempBlock) {
       !isSearchResult &&
       (tempBlock.title.includes(".") ||
         tempBlock.title.includes("Content of "));
+
+    // Try to determine search type from content
+    let searchType = null;
+    if (isSearchResult) {
+      // Check if this is from SEARCH_CODE or SEARCH_REQUIREMENTS by looking at file extensions
+      const codeExtensions = [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".py",
+        ".java",
+        ".c",
+        ".cpp",
+        ".cs",
+        ".rb",
+        ".go",
+        ".php",
+      ];
+      const reqExtensions = [".md", ".txt", ".rst", ".adoc"];
+
+      const hasCodeFiles = codeExtensions.some((ext) =>
+        tempBlock.content.includes(ext + " (lines")
+      );
+      const hasReqFiles = reqExtensions.some((ext) =>
+        tempBlock.content.includes(ext + " (lines")
+      );
+
+      if (hasCodeFiles && !hasReqFiles) searchType = "code";
+      else if (hasReqFiles && !hasCodeFiles) searchType = "requirements";
+      else searchType = "mixed";
+    }
 
     // Try to determine if it's code or requirements based on file extension
     let isCode = true; // Default to code
@@ -385,11 +415,12 @@ MODE: ${mode}
       prompt += "GOALS:\n" + goals.trim() + "\n\n";
     }
 
-    // Add recent conversation context (last 3 exchanges)
+    // Add recent conversation context (last 3 exchanges) - EXCLUDE temporary blocks
     const conversationLines = conversation.split("\n");
     const exchanges = [];
     let currentExchange = [];
     let inAssistantBox = false;
+    let inTempBlock = false;
 
     for (let i = conversationLines.length - 1; i >= 0; i--) {
       const line = conversationLines[i];
@@ -399,6 +430,19 @@ MODE: ${mode}
         line.includes("=== WAITING FOR YOUR MESSAGE ===") ||
         line === "[write here when ready]"
       ) {
+        continue;
+      }
+
+      // Track temporary block state (skip these entirely)
+      if (line.includes("╚═")) {
+        inTempBlock = true;
+        continue;
+      }
+      if (line.includes("╔═ TEMPORARY:")) {
+        inTempBlock = false;
+        continue;
+      }
+      if (inTempBlock) {
         continue;
       }
 
@@ -435,38 +479,30 @@ MODE: ${mode}
     if (isDirectory) {
       prompt += `## Directory Extraction Guidelines
 
-From the directory listing, extract:
-- File paths you need to examine for your current task
-- Patterns in file organization
-- Notable subdirectories
-- Any unexpected or concerning file structures
+From the directory listing, extract ONLY information relevant to your current task:
+- File paths you need to examine for your specific objective
+- Patterns in file organization that relate to your task
+- Notable subdirectories relevant to what you're working on
+- Any unexpected or concerning file structures that impact your work
+
+DO NOT extract every file - focus on what's needed for your current ${mode} mode objectives.
 
 Format: List only the file paths you need to examine, one per line.
-Example:
-src/auth.js
-src/utils/validation.js
-config/database.json
 
 `;
     } else if (isFileContent) {
       // Multiple files in one block
       prompt += `## File Contents Extraction Guidelines
 
-This block contains multiple files. For each file, extract information relevant to your current task:
-- Key functions/classes and their purposes
-- Important algorithms or business logic  
-- Dependencies and imports
-- Configuration values
-- Security concerns or potential issues
-- TODO/FIXME comments
-- Error handling patterns
-- API endpoints or routes
-- Database queries or schema references
-- Relevant code sections with line numbers
-- Any patterns or architectural decisions
+This block contains multiple files. For each file, extract ONLY information relevant to your current task:
+- Key functions/classes that relate to your specific objective
+- Implementation details needed for your current work
+- Dependencies that affect what you're trying to accomplish
+- Issues or patterns that impact your task
+- Relevant configuration or setup
 
-Remember: You're analyzing multiple files to understand how things work. Extract insights about functionality across files.
-Include file names and line number references where important (e.g., "auth.js Line 45-67: Authentication logic uses bcrypt").
+DO NOT summarize everything - focus on what matters for your current ${mode} mode objectives.
+Remember: You're analyzing files to understand specific aspects, not cataloging all content.
 
 `;
     } else if (isSingleFile) {
@@ -478,57 +514,67 @@ Include file names and line number references where important (e.g., "auth.js Li
       if (isCode) {
         prompt += `## Code Extraction Guidelines
 
-From ${fileName}, extract information relevant to your current task:
-- Key functions/classes and their purposes
-- Important algorithms or business logic  
-- Dependencies and imports
-- Configuration values
-- Security concerns or potential issues
-- TODO/FIXME comments
-- Error handling patterns
-- API endpoints or routes
-- Database queries or schema references
-- Relevant code sections with line numbers
-- Any patterns or architectural decisions
+From ${fileName}, extract ONLY information relevant to your current task:
+- Functions/classes that relate to your specific objective
+- Implementation patterns needed for your work
+- Dependencies affecting your task
+- Security/performance issues impacting your goals
+- Relevant algorithms or business logic
 
-Remember: You're analyzing code to understand how things work. Extract insights about functionality, not just raw code.
-Include line number references where important (e.g., "Line 45-67: Authentication logic uses bcrypt").
+Focus on your current ${mode} mode objectives. DO NOT catalog everything.
+Include line numbers only for findings directly relevant to your task.
 
 `;
       } else {
         prompt += `## Requirements/Documentation Extraction Guidelines
 
-From ${fileName}, extract information relevant to your current task:
-- Key requirements and constraints
-- User stories or use cases
-- Acceptance criteria
-- Business rules and logic
-- Technical specifications
-- Design decisions and rationale
-- Dependencies or prerequisites
-- Open questions or ambiguities
-- Success metrics or KPIs
-- Timeline or milestone information
-- Stakeholder concerns
+From ${fileName}, extract ONLY information relevant to your current task:
+- Requirements that affect your specific work
+- Constraints impacting your approach
+- Business rules relevant to your objectives
+- Open questions about your task area
 
-Remember: You're analyzing requirements to understand what needs to be built. Focus on the "what" and "why".
-Include section references where helpful (e.g., "Section 3.2: Authentication must support OAuth2").
+Focus on your current ${mode} mode objectives. DO NOT summarize the entire document.
 
 `;
       }
     } else if (isSearchResult) {
-      prompt += `## Search Result Extraction Guidelines
+      if (searchType === "code") {
+        prompt += `## Code Search Extraction Guidelines
 
-From these search results, extract:
-- Key findings and their locations (with line numbers)
-- Patterns across multiple files
-- Relevant code snippets (with context)
-- Summary of where and how the search term is used
-- Any concerning or notable usages
+From these search results, extract ONLY findings relevant to your current task:
+- Implementation patterns that relate to your objective
+- Code locations you need to examine further
+- Architecture insights affecting your approach
+- Issues or opportunities for your specific work
 
-Focus on insights and patterns rather than listing every match.
+Focus on your current ${mode} mode objectives. DO NOT list every match.
 
 `;
+      } else if (searchType === "requirements") {
+        prompt += `## Requirements Search Extraction Guidelines
+
+From these search results, extract ONLY findings relevant to your current task:
+- Requirements affecting your specific work
+- Constraints impacting your approach
+- Business rules relevant to your objectives
+- Key documents to review further
+
+Focus on your current ${mode} mode objectives. DO NOT catalog all matches.
+
+`;
+      } else {
+        prompt += `## Search Result Extraction Guidelines
+
+From these search results, extract ONLY findings relevant to your current task:
+- Key discoveries that impact your work
+- Patterns affecting your approach
+- Locations needing further investigation
+
+Focus on your current ${mode} mode objectives, not comprehensive coverage.
+
+`;
+      }
     }
 
     // Add the data to review - ONLY the first temporary block
@@ -540,7 +586,13 @@ Focus on insights and patterns rather than listing every match.
 Extract the relevant information now. Write your analysis as plain text.`;
 
     await fs.writeFile("generated-prompt.md", prompt, "utf8");
-    console.log("✓ Extraction prompt ready in generated-prompt.md");
+    console.log(
+      "✓ Extraction prompt ready in generated-prompt.md (block " +
+        blockNumber +
+        " of " +
+        totalBlocks +
+        ")"
+    );
   } catch (err) {
     console.error("Error building extraction prompt:", err);
   }
@@ -749,13 +801,12 @@ async function handleReadResponse(responseText, tools) {
   const cleanResponse = utils.replaceToolsWithIndicators(responseText, tools);
   await updateConversation(cleanResponse);
 
-  const temporaryBlocks = [];
   const SEARCH_BLOCK_SIZE = 30000; // 30K characters per block
 
-  // Collect all read results first
-  const readResults = [];
+  // Collect all results first (both reads and searches)
+  const allResults = [];
 
-  // Process all read tools and collect results
+  // Process all tools and collect results
   for (let i = 0; i < tools.length; i++) {
     const tool = tools[i];
 
@@ -794,6 +845,7 @@ async function handleReadResponse(responseText, tools) {
         const lines = rawResult.split("\n");
         let fileName = "";
         let content = rawResult;
+        let isDirectory = false;
 
         if (
           lines[0].startsWith("Content of ") ||
@@ -805,18 +857,24 @@ async function handleReadResponse(responseText, tools) {
             .replace(":", "")
             .trim();
           content = lines.slice(1).join("\n");
+          isDirectory = lines[0].startsWith("Contents of ");
         } else {
           fileName = tool.params.file_name || tool.params.path || ".";
         }
 
-        // Add to read results list
-        readResults.push({
+        // Add to results list
+        allResults.push({
+          type: isDirectory ? "directory" : "file",
           fileName: fileName,
           content: content,
-          isDirectory: lines[0].startsWith("Contents of "),
+          toolName: tool.name,
         });
       }
-    } else if (tool.name === "SEARCH_CONTENT") {
+    } else if (
+      tool.name === "SEARCH_CONTENT" ||
+      tool.name === "SEARCH_CODE" ||
+      tool.name === "SEARCH_REQUIREMENTS"
+    ) {
       // Execute the search
       const rawResult = await executeTool(tool);
 
@@ -824,61 +882,22 @@ async function handleReadResponse(responseText, tools) {
         await updateConversation(
           "SYSTEM: Tool result (" + tool.name + ")\n" + rawResult
         );
-      } else if (rawResult.startsWith("No content found matching")) {
+      } else if (
+        rawResult.startsWith("No content found matching") ||
+        rawResult.startsWith("No files found matching")
+      ) {
         // No search results - add directly without temporary block
         await updateConversation(
           "SYSTEM: Tool result (" + tool.name + ")\n" + rawResult
         );
       } else {
-        const title = 'Search results for "' + tool.params.regex + '"';
-
-        // For search results, check if we need to split into multiple blocks
-        if (rawResult.length <= SEARCH_BLOCK_SIZE) {
-          temporaryBlocks.push({ title, content: rawResult });
-        } else {
-          // Split search results into blocks
-          const lines = rawResult.split("\n");
-          const searchBlocks = [];
-          let currentBlock = [];
-          let currentSize = 0;
-
-          for (let j = 0; j < lines.length; j++) {
-            const line = lines[j];
-            const lineSize = line.length + 1; // +1 for newline
-
-            // Check if this is a result boundary (new file match)
-            const isNewResult = line.match(/^[^\s].*\(lines \d+-\d+\):$/);
-
-            if (
-              isNewResult &&
-              currentSize > 0 &&
-              currentSize + lineSize > SEARCH_BLOCK_SIZE
-            ) {
-              // Start a new block at result boundary
-              searchBlocks.push(currentBlock.join("\n"));
-              currentBlock = [line];
-              currentSize = lineSize;
-            } else {
-              currentBlock.push(line);
-              currentSize += lineSize;
-            }
-          }
-
-          // Add the last block
-          if (currentBlock.length > 0) {
-            searchBlocks.push(currentBlock.join("\n"));
-          }
-
-          // Create numbered blocks
-          for (let k = 0; k < searchBlocks.length; k++) {
-            temporaryBlocks.push({
-              title: title,
-              content: searchBlocks[k],
-              blockNumber: k + 1,
-              totalBlocks: searchBlocks.length,
-            });
-          }
-        }
+        // Add search results to allResults
+        allResults.push({
+          type: "search",
+          fileName: 'Search: "' + tool.params.regex + '"',
+          content: rawResult,
+          toolName: tool.name,
+        });
       }
     } else if (tool.name === "SEARCH_NAME") {
       // Other read tools process normally
@@ -889,57 +908,96 @@ async function handleReadResponse(responseText, tools) {
     }
   }
 
-  // Now group read results into blocks
-  if (readResults.length > 0) {
-    const readBlocks = [];
+  // Now group all results into blocks
+  if (allResults.length > 0) {
+    const blocks = [];
     let currentBlock = [];
     let currentSize = 0;
+    let currentType = null;
 
-    for (let i = 0; i < readResults.length; i++) {
-      const result = readResults[i];
-      // Format: "filename:\n<content>\n\n" (similar to search results)
-      const formattedResult =
-        result.fileName +
-        (result.isDirectory ? " (directory):" : ":") +
-        "\n" +
-        result.content;
+    for (let i = 0; i < allResults.length; i++) {
+      const result = allResults[i];
+
+      // Format based on type
+      let formattedResult;
+      if (result.type === "search") {
+        formattedResult = result.fileName + ":\n" + result.content;
+      } else {
+        formattedResult =
+          result.fileName +
+          (result.type === "directory" ? " (directory):" : ":") +
+          "\n" +
+          result.content;
+      }
+
       const resultSize = formattedResult.length + 2; // +2 for double newline separator
 
-      // Check if adding this result would exceed block size
-      if (currentSize > 0 && currentSize + resultSize > SEARCH_BLOCK_SIZE) {
+      // Determine if we need a new block
+      const needNewBlock =
+        currentSize > 0 &&
+        (currentSize + resultSize > SEARCH_BLOCK_SIZE ||
+          (currentType === "search" && result.type !== "search") ||
+          (currentType !== "search" && result.type === "search"));
+
+      if (needNewBlock) {
         // Save current block and start new one
-        readBlocks.push(currentBlock.join("\n\n"));
+        blocks.push({
+          type: currentType,
+          content: currentBlock.join("\n\n"),
+        });
         currentBlock = [formattedResult];
         currentSize = resultSize;
+        currentType = result.type;
       } else {
         // Add to current block
         currentBlock.push(formattedResult);
         currentSize += resultSize;
+        if (!currentType) currentType = result.type;
       }
     }
 
     // Add the last block
     if (currentBlock.length > 0) {
-      readBlocks.push(currentBlock.join("\n\n"));
-    }
-
-    // Create temporary blocks for read results
-    const title = "File contents";
-    for (let i = 0; i < readBlocks.length; i++) {
-      temporaryBlocks.push({
-        title: title,
-        content: readBlocks[i],
-        blockNumber: readBlocks.length > 1 ? i + 1 : null,
-        totalBlocks: readBlocks.length > 1 ? readBlocks.length : null,
+      blocks.push({
+        type: currentType,
+        content: currentBlock.join("\n\n"),
       });
     }
-  }
 
-  // Add all temporary blocks to conversation with numbering
-  if (temporaryBlocks.length > 0) {
+    // Create temporary blocks
+    const temporaryBlocks = [];
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+
+      // Determine title based on content type
+      let title;
+      if (block.type === "search") {
+        title = "Search results";
+      } else if (block.type === "directory") {
+        title = "Folder contents";
+      } else {
+        // Count how many files/directories in this block
+        const fileMatches = (block.content.match(/^[^\n]+:$/gm) || []).length;
+        const dirMatches = (block.content.match(/\(directory\):$/gm) || [])
+          .length;
+        if (dirMatches > 0 && fileMatches === dirMatches) {
+          title = "Folder contents";
+        } else {
+          title = "File contents";
+        }
+      }
+
+      temporaryBlocks.push({
+        title: title,
+        content: block.content,
+        blockNumber: blocks.length > 1 ? i + 1 : null,
+        totalBlocks: blocks.length > 1 ? blocks.length : null,
+      });
+    }
+
+    // Add all temporary blocks to conversation
     for (let i = 0; i < temporaryBlocks.length; i++) {
       const block = temporaryBlocks[i];
-      // Use block's own numbering if it has it
       const blockNumber = block.blockNumber || i + 1;
       const totalBlocks = block.totalBlocks || temporaryBlocks.length;
 
@@ -951,22 +1009,17 @@ async function handleReadResponse(responseText, tools) {
       );
       await updateConversation(tempBlock);
     }
+
+    console.log(
+      "✓ Added " + temporaryBlocks.length + " temporary content blocks"
+    );
   }
 
   // Clear response and build next prompt
   await fs.writeFile("ai-response.md", "", "utf8");
   const buildPrompt = require("./message-to-prompt").buildPrompt;
   await buildPrompt();
-
-  if (temporaryBlocks.length > 0) {
-    console.log(
-      "✓ Added " +
-        temporaryBlocks.length +
-        " temporary content blocks, extraction prompt ready"
-    );
-  } else {
-    console.log("✓ Read operations complete, next prompt ready");
-  }
+  console.log("✓ Extraction prompt ready");
 }
 
 async function handleWriteResponse(responseText, tools) {
@@ -1164,6 +1217,10 @@ async function executeTool(tool) {
       return await executeSearchFilesByName(tool.params);
     case "SEARCH_CONTENT":
       return await executeSearchFilesByContent(tool.params);
+    case "SEARCH_CODE":
+      return await executeSearchCode(tool.params);
+    case "SEARCH_REQUIREMENTS":
+      return await executeSearchRequirements(tool.params);
     case "CREATE":
       return await executeCreateFile(tool.params);
     case "UPDATE":
@@ -1323,6 +1380,72 @@ async function executeRead(params) {
     const targetPath = utils.getCodebasePath(
       params.file_name || params.path || "."
     );
+
+    // Check for binary extensions first
+    const binaryExtensions = [
+      ".jar",
+      ".ear",
+      ".war",
+      ".zip",
+      ".tar",
+      ".gz",
+      ".7z",
+      ".rar",
+      ".exe",
+      ".dll",
+      ".so",
+      ".dylib",
+      ".lib",
+      ".a",
+      ".o",
+      ".class",
+      ".pyc",
+      ".pyo",
+      ".beam",
+      ".elc",
+      ".pdf",
+      ".doc",
+      ".docx",
+      ".xls",
+      ".xlsx",
+      ".ppt",
+      ".pptx",
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".gif",
+      ".bmp",
+      ".ico",
+      ".svg",
+      ".webp",
+      ".mp3",
+      ".mp4",
+      ".avi",
+      ".mov",
+      ".wmv",
+      ".flv",
+      ".webm",
+      ".ttf",
+      ".otf",
+      ".woff",
+      ".woff2",
+      ".eot",
+      ".db",
+      ".sqlite",
+      ".sqlite3",
+      ".min.js",
+      ".min.css",
+    ];
+
+    const fileName = params.file_name || params.path || ".";
+    const ext = path.extname(fileName).toLowerCase();
+    if (binaryExtensions.includes(ext)) {
+      return (
+        "Error: Cannot read " +
+        fileName +
+        " - binary and compressed files are not supported. Only plain text files can be read."
+      );
+    }
 
     // Check if it's a directory or file
     const stats = await fs.stat(targetPath);
@@ -1581,6 +1704,74 @@ async function executeInsertLines(params) {
     };
   } catch (err) {
     return "Error inserting into " + params.file_name + ": " + err.message;
+  }
+}
+
+async function executeSearchCode(params) {
+  try {
+    const searchPath = utils.getCodebasePath(params.folder);
+    const results = await utils.searchFilesByContent(
+      searchPath,
+      params.regex,
+      "code"
+    );
+    if (results.length === 0) {
+      return (
+        'No content found matching "' +
+        params.regex +
+        '" in code files in ' +
+        params.folder
+      );
+    }
+
+    let output = "";
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const relativePath = path.relative(utils.CODEBASE_PATH, result.file);
+      output +=
+        relativePath + " (lines " + result.lines + "):\n" + result.content;
+      if (i < results.length - 1) {
+        output += "\n\n";
+      }
+    }
+
+    return output;
+  } catch (err) {
+    return "Error searching code: " + err.message;
+  }
+}
+
+async function executeSearchRequirements(params) {
+  try {
+    const searchPath = utils.getCodebasePath(params.folder);
+    const results = await utils.searchFilesByContent(
+      searchPath,
+      params.regex,
+      "requirements"
+    );
+    if (results.length === 0) {
+      return (
+        'No content found matching "' +
+        params.regex +
+        '" in requirements files in ' +
+        params.folder
+      );
+    }
+
+    let output = "";
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const relativePath = path.relative(utils.CODEBASE_PATH, result.file);
+      output +=
+        relativePath + " (lines " + result.lines + "):\n" + result.content;
+      if (i < results.length - 1) {
+        output += "\n\n";
+      }
+    }
+
+    return output;
+  } catch (err) {
+    return "Error searching requirements: " + err.message;
   }
 }
 
@@ -2106,6 +2297,30 @@ const CATEGORY_CONFIGS = {
         )
         .join("\n");
 
+      // Also filter out ALL temporary blocks - they should not be in normal prompts
+      const withoutTempBlocks = cleanedContent
+        .split("\n")
+        .filter((line, index, arr) => {
+          // Check if we're in a temporary block
+          for (let i = index; i >= 0; i--) {
+            if (arr[i].includes("╔═ TEMPORARY:")) {
+              // We're inside a temp block, check if we've hit the end
+              for (let j = i; j <= index; j++) {
+                if (arr[j].includes("╚═") && j <= index) {
+                  // We've passed the end, not in block anymore
+                  break;
+                }
+                if (j === index) {
+                  // Still in block
+                  return false;
+                }
+              }
+            }
+          }
+          return true;
+        })
+        .join("\n");
+
       // Split conversation into individual exchanges
       const lines = cleanedContent.split("\n");
       const exchanges = [];
@@ -2611,6 +2826,8 @@ Tools allowed in the READ response type:
 - [READ_REQUIREMENTS]
 - [SEARCH_NAME]
 - [SEARCH_CONTENT]
+- [SEARCH_CODE]
+- [SEARCH_REQUIREMENTS]
 
 Tools allowed in the WRITE response type: `;
 
@@ -2630,6 +2847,7 @@ Your job is to understand the codebase and requirements:
 - Use READ_CODE to explore source files and examine implementation
 - Use READ_REQUIREMENTS to review documentation and specifications  
 - Use SEARCH_NAME and SEARCH_CONTENT to discover patterns
+- Use SEARCH_CODE for code-specific searches, SEARCH_REQUIREMENTS for docs
 - Use MESSAGE to ask clarifying questions or provide updates
 - Document findings with DISCOVERED blocks (importance 1-10)
 - When you have sufficient understanding, create exploration findings
@@ -2750,7 +2968,7 @@ Finding files with quotes in the name
 \`\`\``,
 
   SEARCH_CONTENT: `**[SEARCH_CONTENT] pattern folder**
-Search content within files. Use quotes for patterns with spaces or special characters. Escape quotes with backslash.
+Search content within ALL text files. Use quotes for patterns with spaces or special characters. Escape quotes with backslash.
 \`\`\`
 [SEARCH_CONTENT] TODO|FIXME .
 Finding all TODO comments
@@ -2763,6 +2981,32 @@ Finding const declarations with spaces
 
 [SEARCH_CONTENT] "console\\.log\\(\\"Hello\\"\\)" .
 Finding console.log with quoted strings
+\`\`\``,
+
+  SEARCH_CODE: `**[SEARCH_CODE] pattern folder**
+Search content within CODE files only (.js, .py, .java, etc). Use quotes for patterns with spaces. Escape quotes with backslash.
+\`\`\`
+[SEARCH_CODE] "class\\s+User" src/
+Finding User class definitions
+
+[SEARCH_CODE] "import.*auth" .
+Finding auth imports
+
+[SEARCH_CODE] "def\\s+process_payment" .
+Finding payment processing functions
+\`\`\``,
+
+  SEARCH_REQUIREMENTS: `**[SEARCH_REQUIREMENTS] pattern folder**
+Search content within DOCUMENTATION files only (.md, .txt, .rst, etc). Use quotes for patterns with spaces. Escape quotes with backslash.
+\`\`\`
+[SEARCH_REQUIREMENTS] "authentication.*required" docs/
+Finding auth requirements
+
+[SEARCH_REQUIREMENTS] "user story" .
+Finding all user stories
+
+[SEARCH_REQUIREMENTS] "acceptance criteria" requirements/
+Finding acceptance criteria
 \`\`\``,
 
   // WRITE tools (mode-specific)
@@ -2988,6 +3232,8 @@ function generatePrompt(options) {
     TOOL_DOCS.READ_REQUIREMENTS,
     TOOL_DOCS.SEARCH_NAME,
     TOOL_DOCS.SEARCH_CONTENT,
+    TOOL_DOCS.SEARCH_CODE,
+    TOOL_DOCS.SEARCH_REQUIREMENTS,
   ].join("\n\n");
 
   // Add WRITE tool docs (mode-specific)
@@ -3453,6 +3699,8 @@ function classifyTools(tools) {
     "READ_REQUIREMENTS",
     "SEARCH_NAME",
     "SEARCH_CONTENT",
+    "SEARCH_CODE",
+    "SEARCH_REQUIREMENTS",
   ];
   const responseTools = [
     "MESSAGE",
@@ -3580,7 +3828,7 @@ async function searchFilesByName(folder, regex) {
   return results;
 }
 
-async function searchFilesByContent(folder, regex) {
+async function searchFilesByContent(folder, regex, fileType) {
   const pattern = new RegExp(regex, "gm");
   const results = [];
 
@@ -3640,6 +3888,64 @@ async function searchFilesByContent(folder, regex) {
     ".min.css",
   ];
 
+  // Define code and requirements file extensions
+  const codeExtensions = [
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".py",
+    ".java",
+    ".c",
+    ".cpp",
+    ".cs",
+    ".rb",
+    ".go",
+    ".php",
+    ".swift",
+    ".kt",
+    ".rs",
+    ".scala",
+    ".clj",
+    ".lua",
+    ".sh",
+    ".bash",
+    ".html",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".sql",
+    ".json",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".h",
+    ".hpp",
+    ".m",
+    ".mm",
+    ".r",
+    ".pl",
+    ".pm",
+    ".t",
+    ".ex",
+    ".exs",
+    ".elm",
+    ".vue",
+    ".svelte",
+    ".astro",
+  ];
+
+  const requirementsExtensions = [
+    ".md",
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".org",
+    ".tex",
+    ".rtf",
+  ];
+
   async function searchDir(dir) {
     try {
       const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -3654,6 +3960,17 @@ async function searchFilesByContent(folder, regex) {
           // Skip binary files
           const ext = path.extname(entry.name).toLowerCase();
           if (binaryExtensions.includes(ext)) {
+            continue;
+          }
+
+          // Filter by file type if specified
+          if (fileType === "code" && !codeExtensions.includes(ext)) {
+            continue;
+          }
+          if (
+            fileType === "requirements" &&
+            !requirementsExtensions.includes(ext)
+          ) {
             continue;
           }
 
