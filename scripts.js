@@ -3,7 +3,6 @@
 
 const fs = require("fs").promises;
 const path = require("path");
-const path = require("path");
 const utils = require("./utils");
 const { generatePrompt } = require("./prompt-generator");
 const {
