@@ -1,5 +1,4 @@
 // message-to-prompt.js
-// message-to-prompt.js
 
 const fs = require('fs').promises;
 const path = require('path');
@@ -357,6 +356,16 @@ You are reviewing data from ${isDirectory ? 'a directory listing' : isFileConten
         continue;
       }
       
+      // Skip ASCII art lines
+      if (line.includes('_____') && line.includes('__') ||
+          line.includes('/  _  \\') ||
+          line.includes('/  /_\\  \\') ||
+          line.includes('/    |    \\') ||
+          line.includes('\\____|__  /') ||
+          line.includes('\\/')) {
+        continue;
+      }
+      
       // Check for user message start (new exchange)
       if (line.startsWith('> ') && currentExchange.length > 0) {
         // Complete the current exchange
@@ -377,8 +386,15 @@ You are reviewing data from ${isDirectory ? 'a directory listing' : isFileConten
         exchanges.push(exchangeText);
         currentExchange = [line]; // Start new exchange with this line
       } else {
-        // Add line to current exchange
-        currentExchange.push(line);
+        // Add line to current exchange (unless it's ASCII art)
+        if (!(line.includes('_____') && line.includes('__') ||
+              line.includes('/  _  \\') ||
+              line.includes('/  /_\\  \\') ||
+              line.includes('/    |    \\') ||
+              line.includes('\\____|__  /') ||
+              line.includes('\\/'))) {
+          currentExchange.push(line);
+        }
       }
     }
     
@@ -529,7 +545,6 @@ module.exports = {
   buildExtractionPrompt: buildExtractionPrompt
 };
 // ==========================================
-// process-response.js
 // process-response.js
 
 const fs = require('fs').promises;
@@ -1708,7 +1723,6 @@ module.exports = {
 };
 // ==========================================
 // prompt-budget-allocator.js
-// prompt-budget-allocator.js
 
 const utils = require('./utils');
 
@@ -2229,7 +2243,6 @@ module.exports = {
 };
 // ==========================================
 // prompt-generator.js
-// prompt-generator.js
 
 const utils = require('./utils');
 
@@ -2572,7 +2585,6 @@ function generatePrompt(options) {
 module.exports = { generatePrompt };
 // ==========================================
 // reset.js
-// reset.js
 
 const fs = require("fs").promises;
 const path = require("path");
@@ -2645,7 +2657,9 @@ if (require.main === module) {
 module.exports = { reset: reset };
 
 // ==========================================
-// utils.js
+// scripts.js
+
+// ==========================================
 // utils.js
 
 const fs = require('fs').promises;
@@ -3911,7 +3925,6 @@ module.exports = {
   generateSimpleASCII: generateSimpleASCII
 };
 // ==========================================
-// watcher.js
 // watcher.js
 
 const fs = require("fs");
